@@ -127,9 +127,11 @@ public class TypeDef implements ParseNode {
                 f.getName(), toSql()));
       }
       // Check whether the column name meets the Metastore's requirements.
+      /*
       if (!MetaStoreUtils.validateName(f.getName().toLowerCase())) {
         throw new AnalysisException("Invalid struct field name: " + f.getName());
       }
+      */
     }
   }
 

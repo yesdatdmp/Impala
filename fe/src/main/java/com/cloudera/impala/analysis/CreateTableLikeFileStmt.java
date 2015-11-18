@@ -201,7 +201,8 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
       throws AnalysisException {
     ArrayList<StructField> structFields = new ArrayList<StructField>();
     for (parquet.schema.Type field: outerGroup.getFields()) {
-      StructField f = new StructField(field.getName(), convertParquetType(field));
+      String fieldName = String.format("`%s`", field.getName());
+      StructField f = new StructField(fieldName, convertParquetType(field));
       structFields.add(f);
     }
     return new StructType(structFields);
@@ -281,6 +282,11 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
       return Type.STRING;
     }
 
+    if (prim.getPrimitiveTypeName() == PrimitiveType.PrimitiveTypeName.BINARY &&
+        orig == OriginalType.ENUM) {
+        return Type.BINARY;
+    }
+
     if (orig == OriginalType.DECIMAL) {
       return ScalarType.createDecimalType(prim.getDecimalMetadata().getPrecision(),
                                            prim.getDecimalMetadata().getScale());
@@ -334,7 +340,7 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
       Preconditions.checkNotNull(type);
       String colName = field.getName();
       schema.add(new ColumnDef(colName, new TypeDef(type),
-          "Inferred from Parquet file."));
+          "Inferred from: " + field.toString()));
     }
     return schema;
   }

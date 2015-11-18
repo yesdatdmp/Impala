@@ -10,9 +10,11 @@
 
 # prefer the thrift version supplied in THRIFT_HOME
 message(STATUS "THRIFT_HOME: $ENV{THRIFT_HOME}")
+set(THIRDPARTY_THRIFT $ENV{IMPALA_HOME}/thirdparty/thrift-0.9.0)
 find_path(THRIFT_INCLUDE_DIR thrift/Thrift.h HINTS
   ${THRIFT_ROOT}/include
   $ENV{THRIFT_HOME}/include/
+  $ENV{THIRDPARTY_THRIFT}/build/include
   /usr/local/include/
   /opt/local/include/
 )
@@ -24,12 +26,13 @@ find_path(THRIFT_CONTRIB_DIR share/fb303/if/fb303.thrift HINTS
 )
 
 set(THRIFT_LIB_PATHS
+  $ENV{THRIRDPARTY_THRIFT}/build/lib64
   ${THRIFT_ROOT}/lib
-  $ENV{THRIFT_HOME}/lib
-  /usr/local/lib
-  /opt/local/lib)
+  $ENV{THRIFT_HOME}/lib)
 
-find_path(THRIFT_STATIC_LIB_PATH libthrift.a PATHS ${THRIFT_LIB_PATHS})
+MESSAGE(STATUS "THIRDPARTY_THRIFT: " ${THIRDPARTY_THRIFT})
+find_path(THRIFT_STATIC_LIB_PATH libthrift.a PATHS ${THIRDPARTY_THRIFT}/build/lib64)
+#  ${THRIFT_LIB_PATHS})
 
 # prefer the thrift version supplied in THRIFT_HOME
 find_library(THRIFT_LIB NAMES thrift HINTS ${THRIFT_LIB_PATHS})

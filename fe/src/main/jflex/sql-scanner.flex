@@ -300,8 +300,8 @@ FLit3 = [0-9]+
 Exponent = [eE] [+-]? [0-9]+
 DecimalLiteral = ({FLit1}|{FLit2}|{FLit3}) {Exponent}?
 
-IdentifierOrKw = [:digit:]*[:jletter:][:jletterdigit:]* | "&&" | "||"
 QuotedIdentifier = \`(\\.|[^\\\`])*\`
+IdentifierOrKw = [:digit:]*[:jletter:][:jletterdigit:]* | "&&" | "||"
 SingleQuoteStringLiteral = \'(\\.|[^\\\'])*\'
 DoubleQuoteStringLiteral = \"(\\.|[^\\\"])*\"
 
