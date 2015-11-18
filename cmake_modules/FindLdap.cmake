@@ -15,9 +15,10 @@ set(LDAP_SEARCH_LIB_PATH
   ${THIRDPARTY}/openldap-$ENV{IMPALA_OPENLDAP_VERSION}/impala_install/lib
 )
 
+
 find_path(LDAP_INCLUDE_DIR ldap.h PATHS
   ${OPENLDAP_ROOT}/include
-  ${THIRDPARTY_LDAP}/impala_install/include
+  ${THIRDPARTY}/openldap-$ENV{IMPALA_OPENLDAP_VERSION}/impala_install/include
   NO_DEFAULT_PATH)
 
 find_library(LDAP_STATIC_LIBRARY libldap.a
@@ -34,6 +35,9 @@ find_library(LBER_STATIC_LIBRARY liblber.a
 
 if (NOT LDAP_STATIC_LIBRARY OR NOT LBER_STATIC_LIBRARY OR
     NOT LDAP_INCLUDE_DIR)
+  MESSAGE( STATUS "THIRDPARTY_LDAP: " ${THIRDPARTY_LDAP} )
+  MESSAGE( STATUS "LDAP_INCLUDE_DIR: " ${LDAP_INCLUDE_DIR} )
+  MESSAGE( STATUS "LDAP_SEARCH_LIB_PATH: " ${LDAP_SEARCH_LIB_PATH})
   message(FATAL_ERROR "LDAP includes and libraries NOT found.")
   set(LDAP_FOUND TRUE)
 else()
