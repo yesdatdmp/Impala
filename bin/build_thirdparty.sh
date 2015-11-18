@@ -227,7 +227,8 @@ fi
 # Build Ldap
 if [ $BUILD_ALL -eq 1 ] || [ $BUILD_LDAP -eq 1 ]; then
     build_preamble $IMPALA_HOME/thirdparty/openldap-${IMPALA_OPENLDAP_VERSION} Openldap
-    ./configure --enable-slapd=no --prefix=`pwd`/impala_install --enable-static --with-pic
+    ./configure  --prefix=`pwd`/impala_install --enable-static --with-pic --enable-bdb=no --enable-hdb=no
+#--enable-slapd=no
      make -j${IMPALA_BUILD_THREADS:-4}
      make -j${IMPALA_BUILD_THREADS:-4} depend
     make install
