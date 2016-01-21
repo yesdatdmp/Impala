@@ -30,11 +30,12 @@ import subprocess
 from tests.common.test_result_verifier import *
 from tests.common.test_vector import *
 from tests.common.impala_test_suite import *
-from tests.common.skip import SkipIfS3, SkipIfIsilon
+from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
 
 
 @SkipIfS3.hive
 @SkipIfIsilon.hive
+@SkipIfLocal.hive
 class TestHmsIntegration(ImpalaTestSuite):
 
   @classmethod
@@ -44,6 +45,10 @@ class TestHmsIntegration(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestHmsIntegration, cls).add_test_dimensions()
+
+    if cls.exploration_strategy() != 'exhaustive':
+      pytest.skip("Should only run in exhaustive due to long execution time.")
+
     # There is no reason to run these tests using all dimensions.
     cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
     cls.TestMatrix.add_dimension(

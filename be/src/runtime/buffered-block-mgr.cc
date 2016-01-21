@@ -44,15 +44,18 @@ SpinLock BufferedBlockMgr::static_block_mgrs_lock_;
 
 
 struct BufferedBlockMgr::Client {
-  Client(BufferedBlockMgr* mgr, int num_reserved_buffers, MemTracker* tracker,
+  Client(BufferedBlockMgr* mgr, int num_reserved_buffers,
+      bool tolerates_oversubscription, MemTracker* tracker,
          RuntimeState* state)
       : mgr_(mgr),
         state_(state),
         tracker_(tracker),
         query_tracker_(mgr_->mem_tracker_->parent()),
         num_reserved_buffers_(num_reserved_buffers),
+        tolerates_oversubscription_(tolerates_oversubscription),
         num_tmp_reserved_buffers_(0),
         num_pinned_buffers_(0) {
+    DCHECK(tracker != NULL);
   }
 
   /// Unowned.
@@ -61,13 +64,13 @@ struct BufferedBlockMgr::Client {
   /// Unowned.
   RuntimeState* state_;
 
-  /// Tracker for this client. Can be NULL. Unowned.
-  /// If this is set, when the client gets a buffer, we update the consumption on this
-  /// tracker. However, we don't want to transfer the buffer from the block mgr to the
-  /// client (i.e. release from the block mgr), since the block mgr is where the
-  /// block mem usage limit is enforced. Even when we give a buffer to a client, the
-  /// buffer is still owned and counts against the block mgr tracker (i.e. there is a
-  /// fixed pool of buffers regardless of if they are in the block mgr or the clients).
+  /// Tracker for this client. Unowned.
+  /// When the client gets a buffer, we update the consumption on this tracker. However,
+  /// we don't want to transfer the buffer from the block mgr to the client (i.e. release
+  /// from the block mgr), since the block mgr is where the block mem usage limit is
+  /// enforced. Even when we give a buffer to a client, the buffer is still owned and
+  /// counts against the block mgr tracker (i.e. there is a fixed pool of buffers
+  /// regardless of if they are in the block mgr or the clients).
   MemTracker* tracker_;
 
   /// This is the common ancestor between the block mgr tracker and the client tracker.
@@ -76,6 +79,10 @@ struct BufferedBlockMgr::Client {
 
   /// Number of buffers reserved by this client.
   int num_reserved_buffers_;
+
+  /// If false, return MEM_LIMIT_EXCEEDED when a reserved buffer cannot be allocated.
+  /// If true, return Status::OK() as with a non-reserved buffer.
+  bool tolerates_oversubscription_;
 
   /// Number of buffers temporarily reserved.
   int num_tmp_reserved_buffers_;
@@ -87,7 +94,7 @@ struct BufferedBlockMgr::Client {
     DCHECK(buffer != NULL);
     if (buffer->len == mgr_->max_block_size()) {
       ++num_pinned_buffers_;
-      if (tracker_ != NULL) tracker_->ConsumeLocal(buffer->len, query_tracker_);
+      tracker_->ConsumeLocal(buffer->len, query_tracker_);
     }
   }
 
@@ -96,7 +103,7 @@ struct BufferedBlockMgr::Client {
     if (buffer->len == mgr_->max_block_size()) {
       DCHECK_GT(num_pinned_buffers_, 0);
       --num_pinned_buffers_;
-      if (tracker_ != NULL) tracker_->ReleaseLocal(buffer->len, query_tracker_);
+      tracker_->ReleaseLocal(buffer->len, query_tracker_);
     }
   }
 
@@ -129,8 +136,8 @@ Status BufferedBlockMgr::Block::Unpin() {
   return block_mgr_->UnpinBlock(this);
 }
 
-Status BufferedBlockMgr::Block::Delete() {
-  return block_mgr_->DeleteBlock(this);
+void BufferedBlockMgr::Block::Delete() {
+  block_mgr_->DeleteBlock(this);
 }
 
 void BufferedBlockMgr::Block::Init() {
@@ -191,7 +198,7 @@ BufferedBlockMgr::BufferedBlockMgr(RuntimeState* state, TmpFileMgr* tmp_file_mgr
   : max_block_size_(block_size),
     // Keep two writes in flight per scratch disk so the disks can stay busy.
     block_write_threshold_(tmp_file_mgr->num_active_tmp_devices() * 2),
-    disable_spill_(state->query_ctx().disable_spilling),
+    disable_spill_(state->query_ctx().disable_spilling || block_write_threshold_ == 0),
     query_id_(state->query_id()),
     tmp_file_mgr_(tmp_file_mgr),
     initialized_(false),
@@ -230,7 +237,8 @@ Status BufferedBlockMgr::Create(RuntimeState* state, MemTracker* parent,
 int64_t BufferedBlockMgr::available_buffers(Client* client) const {
   int64_t unused_reserved = client->num_reserved_buffers_ +
       client->num_tmp_reserved_buffers_ - client->num_pinned_buffers_;
-  return max(0L, remaining_unreserved_buffers()) + max(0L, unused_reserved);
+  return max<int64_t>(0, remaining_unreserved_buffers()) +
+      max<int64_t>(0, unused_reserved);
 }
 
 int64_t BufferedBlockMgr::remaining_unreserved_buffers() const {
@@ -241,10 +249,12 @@ int64_t BufferedBlockMgr::remaining_unreserved_buffers() const {
   return num_buffers;
 }
 
-Status BufferedBlockMgr::RegisterClient(int num_reserved_buffers, MemTracker* tracker,
-    RuntimeState* state, Client** client) {
+Status BufferedBlockMgr::RegisterClient(int num_reserved_buffers,
+    bool tolerates_oversubscription, MemTracker* tracker, RuntimeState* state,
+    Client** client) {
   DCHECK_GE(num_reserved_buffers, 0);
-  Client* aClient = new Client(this, num_reserved_buffers, tracker, state);
+  Client* aClient = new Client(this, num_reserved_buffers, tolerates_oversubscription,
+      tracker, state);
   lock_guard<mutex> lock(lock_);
   *client = obj_pool_.Add(aClient);
   unfullfilled_reserved_buffers_ += num_reserved_buffers;
@@ -298,8 +308,8 @@ bool BufferedBlockMgr::ConsumeMemory(Client* client, int64_t size) {
     return true;
   }
 
-  if (max(0L, remaining_unreserved_buffers()) + client->num_tmp_reserved_buffers_ <
-      buffers_needed) {
+  if (max<int64_t>(0, remaining_unreserved_buffers()) +
+      client->num_tmp_reserved_buffers_ < buffers_needed) {
     return false;
   }
 
@@ -563,10 +573,14 @@ MemTracker* BufferedBlockMgr::get_tracker(Client* client) const {
 //       IMPALA-1884.
 Status BufferedBlockMgr::DeleteOrUnpinBlock(Block* block, bool unpin) {
   if (block == NULL) {
-    lock_guard<mutex> lock(lock_);
-    return is_cancelled_ ? Status::CANCELLED : Status::OK();
+    return IsCancelled() ? Status::CANCELLED : Status::OK();
   }
-  return unpin ? block->Unpin() : block->Delete();
+  if (unpin) {
+    return block->Unpin();
+  } else {
+    block->Delete();
+    return IsCancelled() ? Status::CANCELLED : Status::OK();
+  }
 }
 
 Status BufferedBlockMgr::PinBlock(Block* block, bool* pinned, Block* release_block,
@@ -683,7 +697,7 @@ Status BufferedBlockMgr::WriteUnpinnedBlocks() {
 
   // Assumes block manager lock is already taken.
   while (non_local_outstanding_writes_ + free_io_buffers_.size() < block_write_threshold_
-         && !unpinned_blocks_.empty()) {
+      && !unpinned_blocks_.empty()) {
     // Pop a block from the back of the list (LIFO).
     Block* write_block = unpinned_blocks_.PopBack();
     write_block->client_local_ = false;
@@ -851,7 +865,7 @@ void BufferedBlockMgr::WriteComplete(Block* block, const Status& write_status) {
   }
 }
 
-Status BufferedBlockMgr::DeleteBlock(Block* block) {
+void BufferedBlockMgr::DeleteBlock(Block* block) {
   DCHECK(!block->is_deleted_);
 
   lock_guard<mutex> lock(lock_);
@@ -875,7 +889,7 @@ Status BufferedBlockMgr::DeleteBlock(Block* block) {
         << "Should never be writing a small buffer";
     // If a write is still pending, return. Cleanup will be done in WriteComplete().
     DCHECK(block->Validate()) << endl << block->DebugString();
-    return is_cancelled_ ? Status::CANCELLED : Status::OK();
+    return;
   }
 
   if (block->buffer_desc_ != NULL) {
@@ -897,7 +911,6 @@ Status BufferedBlockMgr::DeleteBlock(Block* block) {
   ReturnUnusedBlock(block);
   DCHECK(block->Validate()) << endl << block->DebugString();
   DCHECK(Validate()) << endl << DebugInternal();
-  return is_cancelled_ ? Status::CANCELLED : Status::OK();
 }
 
 void BufferedBlockMgr::ReturnUnusedBlock(Block* block) {
@@ -967,7 +980,7 @@ Status BufferedBlockMgr::FindBufferForBlock(Block* block, bool* in_mem) {
     if (buffer_desc == NULL) {
       // There are no free buffers or blocks we can evict. We need to fail this request.
       // If this is an optional request, return OK. If it is required, return OOM.
-      if (!is_reserved_request) return Status::OK();
+      if (!is_reserved_request || client->tolerates_oversubscription_) return Status::OK();
 
       if (VLOG_QUERY_IS_ON) {
         stringstream ss;
@@ -1002,15 +1015,15 @@ Status BufferedBlockMgr::FindBufferForBlock(Block* block, bool* in_mem) {
 
   DCHECK(block->Validate()) << endl << block->DebugString();
   // The number of free buffers has decreased. Write unpinned blocks if the number
-  // of free buffers below the threshold is reached.
+  // of free buffers is less than the threshold.
   RETURN_IF_ERROR(WriteUnpinnedBlocks());
   DCHECK(Validate()) << endl << DebugInternal();
   return Status::OK();
 }
 
 // We need to find a new buffer. We prefer getting this buffer in this order:
-//  1. Allocate a new block if the number of free blocks is less than the write
-//     threshold, until we run out of memory.
+//  1. Allocate a new block if the number of free blocks is less than the write threshold
+//     or if we are running without spilling, until we run out of memory.
 //  2. Pick a buffer from the free list.
 //  3. Wait and evict an unpinned buffer.
 Status BufferedBlockMgr::FindBuffer(unique_lock<mutex>& lock,
@@ -1018,7 +1031,8 @@ Status BufferedBlockMgr::FindBuffer(unique_lock<mutex>& lock,
   *buffer_desc = NULL;
 
   // First, try to allocate a new buffer.
-  if (free_io_buffers_.size() < block_write_threshold_ &&
+  DCHECK(block_write_threshold_ > 0 || disable_spill_);
+  if ((free_io_buffers_.size() < block_write_threshold_ || disable_spill_) &&
       mem_tracker_->TryConsume(max_block_size_)) {
     uint8_t* new_buffer = new uint8_t[max_block_size_];
     *buffer_desc = obj_pool_.Add(new BufferDescriptor(new_buffer, max_block_size_));
@@ -1032,10 +1046,16 @@ Status BufferedBlockMgr::FindBuffer(unique_lock<mutex>& lock,
     // There are no free buffers. If spills are disabled or there no unpinned blocks we
     // can write, return. We can't get a buffer.
     if (disable_spill_) {
-      return Status("Spilling has been disabled for plans that do not have stats and "
-          "are not hinted to prevent potentially bad plans from using too many cluster "
-          "resources. Compute stats on these tables, hint the plan or disable this "
-          "behavior via query options to enable spilling.");
+      if (block_write_threshold_ == 0) {
+        return Status("Spilling has been disabled due to no usable scratch space. "
+            "Please specify a usable scratch space location via the scratch_dirs "
+            "impalad flag.");
+      } else {
+        return Status("Spilling has been disabled for plans that do not have stats and "
+            "are not hinted to prevent potentially bad plans from using too many cluster "
+            "resources. Please run COMPUTE STATS on these tables, hint the plan or "
+            "disable this behavior via the DISABLE_UNSAFE_SPILLS query option.");
+      }
     }
 
     // Third, this block needs to use a buffer that was unpinned from another block.
@@ -1152,8 +1172,8 @@ bool BufferedBlockMgr::Validate() const {
     block = block->Next();
   }
 
-  // Check if we're writing blocks when the number of free buffers falls below
-  // threshold. We don't write blocks after cancellation.
+  // Check if we're writing blocks when the number of free buffers is less than
+  // the write threshold. We don't write blocks after cancellation.
   if (!is_cancelled_ && !unpinned_blocks_.empty() && !disable_spill_ &&
       (free_io_buffers_.size() + non_local_outstanding_writes_ <
        block_write_threshold_)) {

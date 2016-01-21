@@ -37,20 +37,23 @@ PROJECT(ASSEMBLER)
 #  -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG: enable nanosecond precision for boost
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall -Wno-sign-compare -Wno-unknown-pragmas -pthread")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fno-strict-aliasing")
+SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -std=c++14")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated")
 SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
-SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
 
-if (IMPALA_TOOLCHAIN)
-  SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -static-libstdc++")
+# On Apple we build with clang and need libstdc++ instead of libc++
+if (APPLE)
+  SET(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -stdlib=libstdc++")
 endif()
+
+SET(CXX_COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage")
 
 # For any clang builds (currently only ASAN):
 #   -Qunused-arguments: quiet warnings about unused arguments to clang because ccache
 #        makes extra calls to clang which may have extra includes (-I) that are unused.
 #   -fcolor-diagnostics: ensure clang generates colorized output, which is necessary
 #        when using ccache as clang thinks it is not called from a terminal.
-SET(CXX_CLANG_FLAGS "-Qunused-arguments -fcolor-diagnostics")
+SET(CXX_CLANG_FLAGS "-Qunused-arguments -fcolor-diagnostics -Wno-unused-local-typedef")
 # For any gcc builds:
 #   -g: Enable symbols for profiler tools
 #   -Wno-unused-local-typedefs: Do not warn for local typedefs that are unused.
@@ -126,8 +129,11 @@ add_definitions(-DHAVE_INTTYPES_H -DHAVE_NETINET_IN_H -DHAVE_NETDB_H)
 # Note that we don't enable any optimization. We want unoptimized IR since we will be
 # modifying it at runtime, then re-compiling (and optimizing) the modified code. The final
 # optimizations will be less effective if the initial code is also optimized.
+#  -Wno-deprecated: gutil contains deprecated headers
+#  -Wno-c++11-extensions: c++11 extensions are ok as long as clang supports them
 set(CLANG_IR_CXX_FLAGS "-emit-llvm" "-c" "-DIR_COMPILE" "-DNDEBUG"
-  "-DHAVE_INTTYPES_H" "-DHAVE_NETINET_IN_H" "-DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
+  "-DHAVE_INTTYPES_H" "-DHAVE_NETINET_IN_H" "-DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG"
+  "-Wno-deprecated" "-Wno-c++11-extensions")
 
 # setup doc generation with Doxygen
 find_package(Doxygen)
@@ -219,6 +225,14 @@ else()
   set(BUILD_OUTPUT_ROOT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/release/")
 endif()
 
+# Create a latest link so that scripts can pick up the correct build automatically
+FILE(MAKE_DIRECTORY ${BUILD_OUTPUT_ROOT_DIRECTORY})
+if (NOT APPLE)
+  set(MORE_ARGS "-T")
+endif()
+EXECUTE_PROCESS(COMMAND ln ${MORE_ARGS} -sf ${BUILD_OUTPUT_ROOT_DIRECTORY}
+  ${CMAKE_CURRENT_SOURCE_DIR}/build/latest)
+
 # This is a list of impala library dependencies. Individual libraries
 # must not specify library dependencies in their own CMakeLists.txt file.
 # Enclose the impala libraries in -Wl,--start-group and -Wl,--end-group
@@ -226,8 +240,15 @@ endif()
 # the order in which impala libraries are listed below does not matter.
 # Note: The ld documentation discourages auto-resolving cyclic dependencies
 # for performance reasons.
+if (NOT APPLE)
+  # When compiling on Mac with clang using these linker flags are undefined and Clang on
+  # Mac will abort on unknown compiler or linker flags. In the long-term we should
+  # move away from using these flags to have a coherent build on OS X and Linux.
+  set(WL_START_GROUP "-Wl,--start-group")
+  set(WL_END_GROUP "-Wl,--end-group")
+endif()
 set (IMPALA_LINK_LIBS
-  -Wl,--start-group
+  ${WL_START_GROUP}
   Catalog
   CodeGen
   Common
@@ -246,7 +267,7 @@ set (IMPALA_LINK_LIBS
   Udf
   Util
   Webserver
-  -Wl,--end-group
+  ${WL_END_GROUP}
 )
 
 # If using dynamic linking, -Wl does not have any effect (it's only for .a files). So we

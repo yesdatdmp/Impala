@@ -108,14 +108,18 @@ class HashTableCtx {
   ///  - build_exprs are the exprs that should be used to evaluate rows during Insert().
   ///  - probe_exprs are used during Find()
   ///  - stores_nulls: if false, TupleRows with nulls are ignored during Insert
-  ///  - finds_nulls: if false, Find() returns End() for TupleRows with nulls
-  ///      even if stores_nulls is true
+  ///  - finds_nulls: if finds_nulls[i] is false, Find() returns End() for TupleRows with
+  ///      nulls in position i even if stores_nulls is true.
   ///  - initial_seed: Initial seed value to use when computing hashes for rows with
   ///    level 0. Other levels have their seeds derived from this seed.
   ///  - The max levels we will hash with.
+  /// TODO: stores_nulls is too coarse: for a hash table in which some columns are joined
+  ///       with '<=>' and others with '=', stores_nulls could distinguish between columns
+  ///       in which nulls are stored and columns in which they are not, which could save
+  ///       space by not storing some rows we know will never match.
   HashTableCtx(const std::vector<ExprContext*>& build_expr_ctxs,
       const std::vector<ExprContext*>& probe_expr_ctxs, bool stores_nulls,
-      bool finds_nulls, int32_t initial_seed, int max_levels,
+      const std::vector<bool>& finds_nulls, int32_t initial_seed, int max_levels,
       int num_build_tuples);
 
   /// Call to cleanup any resources.
@@ -235,7 +239,10 @@ class HashTableCtx {
   /// TODO: these constants are an ideal candidate to be removed with codegen.
   /// TODO: ..or with template-ization
   const bool stores_nulls_;
-  const bool finds_nulls_;
+  const std::vector<bool> finds_nulls_;
+
+  /// finds_some_nulls_ is just the logical OR of finds_nulls_.
+  const bool finds_some_nulls_;
 
   /// The current level this context is working on. Each level needs to use a
   /// different seed.
@@ -299,7 +306,8 @@ class HashTable {
     /// TODO: Fold this flag in the next pointer below.
     bool matched;
 
-    DuplicateNode* next; // Chain to next duplicate node, NULL when end of list.
+    /// Chain to next duplicate node, NULL when end of list.
+    DuplicateNode* next;
     HtData htdata;
   };
 
@@ -331,24 +339,21 @@ class HashTable {
  public:
   class Iterator;
 
-  /// Create a hash table.
+  /// Returns a newly allocated HashTable. The probing algorithm is set by the
+  /// FLAG_enable_quadratic_probing.
   ///  - client: block mgr client to allocate data pages from.
   ///  - num_build_tuples: number of Tuples in the build tuple row.
   ///  - tuple_stream: the tuple stream which contains the tuple rows index by the
   ///    hash table. Can be NULL if the rows contain only a single tuple, in which
-  ///    the 'tuple_stream' is unused.
+  ///    case the 'tuple_stream' is unused.
   ///  - max_num_buckets: the maximum number of buckets that can be stored. If we
   ///    try to grow the number of buckets to a larger number, the inserts will fail.
   ///    -1, if it unlimited.
-  ///  - initial_num_buckets: number of buckets that the hash table
-  ///    should be initialized with.
-  HashTable(RuntimeState* state, BufferedBlockMgr::Client* client,
-      int num_build_tuples, BufferedTupleStream* tuple_stream,
-      int64_t max_num_buckets, int64_t initial_num_buckets = 1024);
-
-  /// Ctor used only for testing. Memory is allocated from the 'pool' instead of the
-  /// block mgr.
-  HashTable(MemPool* pool, bool quadratic_probing, int num_buckets);
+  ///  - initial_num_buckets: number of buckets that the hash table should be initialized
+  ///    with.
+  static HashTable* Create(RuntimeState* state, BufferedBlockMgr::Client* client,
+      int num_build_tuples, BufferedTupleStream* tuple_stream, int64_t max_num_buckets,
+      int64_t initial_num_buckets);
 
   /// Allocates the initial bucket structure. Returns false if OOM.
   bool Init();
@@ -357,6 +362,8 @@ class HashTable {
   void Close();
 
   /// Inserts the row to the hash table. Returns true if the insertion was successful.
+  /// Always returns true if the table has free buckets and the key is not a duplicate.
+  /// The caller is responsible for ensuring that the table has free buckets
   /// 'idx' is the index into tuple_stream_ for this row. If the row contains more than
   /// one tuple, the 'idx' is stored instead of the 'row'. The 'row' is not copied by the
   /// hash table and the caller must guarantee it stays in memory. This will not grow the
@@ -378,6 +385,13 @@ class HashTable {
   /// the nodes of a bucket are duplicates. One scan can be in progress for each 'ht_ctx'.
   /// Used during the probe phase of hash joins.
   Iterator IR_ALWAYS_INLINE Find(HashTableCtx* ht_ctx, uint32_t hash);
+
+  /// If a match is found in the table, return an iterator as in Find(). If a match was
+  /// not present, return an iterator pointing to the empty bucket where the key should
+  /// be inserted. Returns End() if the table is full. The caller can set the data in
+  /// the bucket using a Set*() method on the iterator.
+  Iterator IR_ALWAYS_INLINE FindBucket(HashTableCtx* ht_ctx, uint32_t hash,
+      bool* found);
 
   /// Returns number of elements inserted in the hash table
   int64_t size() const {
@@ -479,6 +493,11 @@ class HashTable {
     TupleRow* GetRow() const;
     Tuple* GetTuple() const;
 
+    /// Set the current tuple for an empty bucket. Designed to be used with the
+    /// iterator returned from FindBucket() in the case when the value is not found.
+    /// It is not valid to call this function if the bucket already has an entry.
+    void SetTuple(Tuple* tuple, uint32_t hash);
+
     /// Sets as matched the Bucket or DuplicateNode currently pointed by the iterator,
     /// depending on whether the bucket has duplicates or not. The iterator cannot be
     /// AtEnd().
@@ -519,6 +538,14 @@ class HashTable {
   friend class Iterator;
   friend class HashTableTest;
 
+  /// Hash table constructor. Private because Create() should be used, instead
+  /// of calling this constructor directly.
+  ///  - quadratic_probing: set to true when the probing algorithm is quadratic, as
+  ///    opposed to linear.
+  HashTable(bool quadratic_probing, RuntimeState* state, BufferedBlockMgr::Client* client,
+      int num_build_tuples, BufferedTupleStream* tuple_stream,
+      int64_t max_num_buckets, int64_t initial_num_buckets);
+
   /// Performs the probing operation according to the probing algorithm (linear or
   /// quadratic. Returns one of the following:
   /// (a) the index of the bucket that contains the entry that matches with the last row
@@ -533,7 +560,7 @@ class HashTable {
   /// EvalAndHashBuild() or EvalAndHashProb(e) must have been called before calling this.
   /// 'hash' must be the hash returned by these functions.
   /// 'found' indicates that a bucket that contains an equal row is found.
-  //
+  ///
   /// There are wrappers of this function that perform the Find and Insert logic.
   int64_t IR_ALWAYS_INLINE Probe(Bucket* buckets, int64_t num_buckets,
       HashTableCtx* ht_ctx, uint32_t hash,  bool* found);
@@ -566,8 +593,8 @@ class HashTable {
   /// allocate a new DuplicateNode.
   DuplicateNode* IR_ALWAYS_INLINE InsertDuplicateNode(int64_t bucket_idx);
 
-  /// Resets the contents of the bucket with index 'bucket_idx', in preparation for an
-  /// insert. Sets all the fields of the bucket other than 'data'.
+  /// Resets the contents of the empty bucket with index 'bucket_idx', in preparation for
+  /// an insert. Sets all the fields of the bucket other than 'data'.
   void IR_ALWAYS_INLINE PrepareBucketForInsert(int64_t bucket_idx, uint32_t hash);
 
   /// Return the TupleRow pointed by 'htdata'.
@@ -593,9 +620,6 @@ class HashTable {
   /// row only contains a single tuple, in which case the TupleRow indirection
   /// is removed by the hash table.
   BufferedTupleStream* tuple_stream_;
-
-  /// Only used for tests to allocate data pages instead of the block mgr.
-  MemPool* data_page_pool_;
 
   /// Constants on how the hash table should behave. Joins and aggs have slightly
   /// different behavior.
@@ -639,7 +663,7 @@ class HashTable {
 
   /// Number of build tuples, used for constructing temp row* for probes.
   /// TODO: We should remove it.
-  int num_build_tuples_;
+  const int num_build_tuples_;
 
   /// Flag used to disable spilling hash tables that already had matches in case of
   /// right joins (IMPALA-1488).
@@ -648,7 +672,7 @@ class HashTable {
 
   /// The stats below can be used for debugging perf.
   /// TODO: Should we make these statistics atomic?
-  /// Number of calls to either Find, Insert or FindOrInsert an entry.
+  /// Number of Find(), Insert(), or FindBucket() calls that probe the hash table.
   int64_t num_probes_;
 
   /// Number of probes that failed and had to fall back to linear probing without cap.

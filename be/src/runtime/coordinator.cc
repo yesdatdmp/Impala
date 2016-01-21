@@ -46,7 +46,7 @@
 #include "runtime/plan-fragment-executor.h"
 #include "runtime/row-batch.h"
 #include "runtime/parallel-executor.h"
-#include "statestore/scheduler.h"
+#include "scheduling/scheduler.h"
 #include "exec/data-sink.h"
 #include "exec/scan-node.h"
 #include "util/container-util.h"
@@ -109,8 +109,9 @@ class Coordinator::BackendExecState {
   const TNetworkAddress backend_address;  // of ImpalaInternalService
   int64_t total_split_size;  // summed up across all splits; in bytes
 
-  // assembled in c'tor
-  TExecPlanFragmentParams rpc_params;
+  // Created in Coordinator::Exec() and destroyed after call to
+  // ParallelExecutor::Exec() to release the memory.
+  TExecPlanFragmentParams* rpc_params;
 
   // Fragment idx for this ExecState
   int fragment_idx;
@@ -143,10 +144,12 @@ class Coordinator::BackendExecState {
       const TNetworkAddress& coord_address,
       int backend_num, const TPlanFragment& fragment, int fragment_idx,
       const FragmentExecParams& params, int instance_idx,
-      DebugOptions* debug_options, ObjectPool* obj_pool)
+      DebugOptions* debug_options, ObjectPool* obj_pool,
+      TExecPlanFragmentParams* plan_fragment_params)
     : fragment_instance_id(params.instance_ids[instance_idx]),
       backend_address(params.hosts[instance_idx]),
       total_split_size(0),
+      rpc_params(plan_fragment_params),
       fragment_idx(fragment_idx),
       instance_idx(instance_idx),
       initiated(false),
@@ -157,12 +160,11 @@ class Coordinator::BackendExecState {
     ss << "Instance " << PrintId(fragment_instance_id)
        << " (host=" << backend_address << ")";
     profile = obj_pool->Add(new RuntimeProfile(obj_pool, ss.str()));
-    coord->SetExecPlanFragmentParams(schedule, backend_num, fragment, fragment_idx,
-        params, instance_idx, coord_address, &rpc_params);
+
     if (debug_options != NULL) {
-      rpc_params.params.__set_debug_node_id(debug_options->node_id);
-      rpc_params.params.__set_debug_action(debug_options->action);
-      rpc_params.params.__set_debug_phase(debug_options->phase);
+      rpc_params->params.__set_debug_node_id(debug_options->node_id);
+      rpc_params->params.__set_debug_action(debug_options->action);
+      rpc_params->params.__set_debug_phase(debug_options->phase);
     }
     ComputeTotalSplitSize();
   }
@@ -188,7 +190,7 @@ class Coordinator::BackendExecState {
 };
 
 void Coordinator::BackendExecState::ComputeTotalSplitSize() {
-  const PerNodeScanRanges& per_node_scan_ranges = rpc_params.params.per_node_scan_ranges;
+  const PerNodeScanRanges& per_node_scan_ranges = rpc_params->params.per_node_scan_ranges;
   total_split_size = 0;
   BOOST_FOREACH(const PerNodeScanRanges::value_type& entry, per_node_scan_ranges) {
     BOOST_FOREACH(const TScanRangeParams& scan_range_params, entry.second) {
@@ -401,6 +403,13 @@ Status Coordinator::Exec(QuerySchedule& schedule,
   md.__set_units(TUnit::TIME_NS);
   md.__set_kind(TMetricKind::STATS);
   StatsMetric<double> latencies(md);
+
+  // TExecPlanFragmentParams can be arbitrarily large depending on number of tables &
+  // partitions in rpc_params->desc_tbl, to avoid memory pressure on the coordinator
+  // rpc_params is stored in rpc_params_pool which is cleared after
+  // ParallelExecutor::Exec as the rpc_params are no longer needed.
+  ObjectPool rpc_params_pool;
+
   for (int fragment_idx = (has_coordinator_fragment ? 1 : 0);
        fragment_idx < request.fragments.size(); ++fragment_idx) {
     const FragmentExecParams& params = (*fragment_exec_params)[fragment_idx];
@@ -415,11 +424,18 @@ Status Coordinator::Exec(QuerySchedule& schedule,
                 || debug_options.backend_num == backend_num)
             ? &debug_options
             : NULL);
+
+      TExecPlanFragmentParams* rpc_params =
+          rpc_params_pool.Add(new TExecPlanFragmentParams());
+      SetExecPlanFragmentParams(schedule, backend_num,
+          request.fragments[fragment_idx], fragment_idx,params,instance_idx,
+          coord, rpc_params);
+
       // TODO: pool of pre-formatted BackendExecStates?
       BackendExecState* exec_state =
           obj_pool()->Add(new BackendExecState(schedule, this, coord, backend_num,
               request.fragments[fragment_idx], fragment_idx,
-              params, instance_idx, backend_debug_options, obj_pool()));
+              params, instance_idx, backend_debug_options, obj_pool(), rpc_params));
       backend_exec_states_[backend_num] = exec_state;
       ++backend_num;
       VLOG(2) << "Exec(): starting instance: fragment_idx=" << fragment_idx
@@ -440,6 +456,8 @@ Status Coordinator::Exec(QuerySchedule& schedule,
       CancelInternal();
       return fragments_exec_status;
     }
+    // Clear the ObjectPool as rpc_params are no longer needed
+    rpc_params_pool.Clear();
   }
 
   query_events_->MarkEvent("Remote fragments started");
@@ -469,7 +487,7 @@ Status Coordinator::GetStatus() {
   return query_status_;
 }
 
-Status Coordinator::UpdateStatus(const Status& status, const TUniqueId* instance_id,
+Status Coordinator::UpdateStatus(const Status& status, const TUniqueId& instance_id,
     const string& instance_hostname) {
   {
     lock_guard<mutex> l(lock_);
@@ -489,10 +507,8 @@ Status Coordinator::UpdateStatus(const Status& status, const TUniqueId* instance
   }
 
   // Log the id of the fragment that first failed so we can track it down easier.
-  if (instance_id != NULL) {
-    VLOG_QUERY << "Query id=" << query_id_ << " failed because fragment id="
-               << *instance_id << " on host=" << instance_hostname << " failed.";
-  }
+  VLOG_QUERY << "Query id=" << query_id_ << " failed because fragment id="
+             << instance_id << " on host=" << instance_hostname << " failed.";
 
   return query_status_;
 }
@@ -791,7 +807,8 @@ Status Coordinator::Wait() {
   Status return_status = Status::OK();
   if (executor_.get() != NULL) {
     // Open() may block
-    return_status = UpdateStatus(executor_->Open(), NULL);
+    return_status = UpdateStatus(executor_->Open(),
+        runtime_state()->fragment_instance_id(), FLAGS_hostname);
 
     if (return_status.ok()) {
       // If the coordinator fragment has a sink, it will have finished executing at this
@@ -856,7 +873,7 @@ Status Coordinator::GetNext(RowBatch** batch, RuntimeState* state) {
   // if there was an error, we need to return the query's error status rather than
   // the status we just got back from the local executor (which may well be CANCELLED
   // in that case).  Coordinator fragment failed in this case so we log the query_id.
-  RETURN_IF_ERROR(UpdateStatus(status, &runtime_state()->fragment_instance_id(),
+  RETURN_IF_ERROR(UpdateStatus(status, runtime_state()->fragment_instance_id(),
       FLAGS_hostname));
 
   if (*batch == NULL) {
@@ -1124,7 +1141,7 @@ Status Coordinator::ExecRemoteFragment(void* exec_state_arg) {
 
   TExecPlanFragmentResult thrift_result;
   Status rpc_status = backend_client.DoRpc(&ImpalaInternalServiceClient::ExecPlanFragment,
-      exec_state->rpc_params, &thrift_result);
+      *exec_state->rpc_params, &thrift_result);
   if (!rpc_status.ok()) {
     stringstream msg;
     msg << "ExecPlanRequest rpc query_id=" << query_id_
@@ -1134,6 +1151,10 @@ Status Coordinator::ExecRemoteFragment(void* exec_state_arg) {
     exec_state->status = Status(msg.str());
     return status;
   }
+
+  // rpc_params are not needed beyond this point, set the pointer to NULL.
+  // Memory is freed in Coordinator::Exec().
+  exec_state->rpc_params = NULL;
 
   exec_state->status = thrift_result.status;
   if (exec_state->status.ok()) {
@@ -1321,7 +1342,7 @@ Status Coordinator::UpdateFragmentExecStatus(const TReportExecStatusParams& para
   // and returned_all_results_ is true.
   // (UpdateStatus() initiates cancellation, if it hasn't already been initiated)
   if (!(returned_all_results_ && status.IsCancelled()) && !status.ok()) {
-    UpdateStatus(status, &exec_state->fragment_instance_id,
+    UpdateStatus(status, exec_state->fragment_instance_id,
         TNetworkAddressToString(exec_state->backend_address));
     return Status::OK();
   }
@@ -1518,7 +1539,7 @@ void Coordinator::ReportQuerySummary() {
 
     // Add per node peak memory usage as InfoString
     // Map from Impalad address to peak memory usage of this query
-    typedef boost::unordered_map<TNetworkAddress, int64_t> PerNodePeakMemoryUsage;
+    typedef unordered_map<TNetworkAddress, int64_t> PerNodePeakMemoryUsage;
     PerNodePeakMemoryUsage per_node_peak_mem_usage;
     if (executor_.get() != NULL) {
       // Coordinator fragment is not included in backend_exec_states_.
@@ -1575,7 +1596,8 @@ void Coordinator::SetExecPlanFragmentParams(
     const TNetworkAddress& coord, TExecPlanFragmentParams* rpc_params) {
   rpc_params->__set_protocol_version(ImpalaInternalServiceVersion::V1);
   rpc_params->__set_fragment(fragment);
-  rpc_params->__set_desc_tbl(desc_tbl_);
+  SetExecPlanDescriptorTable(fragment, rpc_params);
+
   TNetworkAddress exec_host = params.hosts[instance_idx];
   if (schedule.HasReservation()) {
     // The reservation has already have been validated at this point.
@@ -1612,4 +1634,70 @@ void Coordinator::SetExecPlanFragmentParams(
   rpc_params->__isset.fragment_instance_ctx = true;
 }
 
+void Coordinator::SetExecPlanDescriptorTable(const TPlanFragment& fragment,
+    TExecPlanFragmentParams* rpc_params) {
+  TDescriptorTable thrift_desc_tbl;
+
+  // Always add the Tuple and Slot descriptors.
+  thrift_desc_tbl.__set_tupleDescriptors(desc_tbl_.tupleDescriptors);
+  thrift_desc_tbl.__set_slotDescriptors(desc_tbl_.slotDescriptors);
+
+  // Collect the TTupleId(s) for ScanNode(s).
+  unordered_set<TTupleId> tuple_ids;
+  BOOST_FOREACH(const TPlanNode& plan_node, fragment.plan.nodes) {
+    // TODO This should change if there is a ScanNode for Kudu.
+    switch (plan_node.node_type) {
+      case TPlanNodeType::HDFS_SCAN_NODE:
+        tuple_ids.insert(plan_node.hdfs_scan_node.tuple_id);
+        break;
+      case TPlanNodeType::HBASE_SCAN_NODE:
+        tuple_ids.insert(plan_node.hbase_scan_node.tuple_id);
+        break;
+      case TPlanNodeType::DATA_SOURCE_NODE:
+        tuple_ids.insert(plan_node.data_source_node.tuple_id);
+        break;
+      case TPlanNodeType::HASH_JOIN_NODE:
+      case TPlanNodeType::AGGREGATION_NODE:
+      case TPlanNodeType::SORT_NODE:
+      case TPlanNodeType::EMPTY_SET_NODE:
+      case TPlanNodeType::EXCHANGE_NODE:
+      case TPlanNodeType::UNION_NODE:
+      case TPlanNodeType::SELECT_NODE:
+      case TPlanNodeType::NESTED_LOOP_JOIN_NODE:
+      case TPlanNodeType::ANALYTIC_EVAL_NODE:
+      case TPlanNodeType::SINGULAR_ROW_SRC_NODE:
+      case TPlanNodeType::UNNEST_NODE:
+      case TPlanNodeType::SUBPLAN_NODE:
+        // Do nothing
+        break;
+      default:
+        DCHECK(false) << "Invalid node type: " << plan_node.node_type;
+    }
+  }
+
+  // Collect TTableId(s) matching the TTupleId(s).
+  unordered_set<TTableId> table_ids;
+  BOOST_FOREACH(const TTupleId& tuple_id, tuple_ids) {
+    BOOST_FOREACH(const TTupleDescriptor& tuple_desc, desc_tbl_.tupleDescriptors) {
+      if (tuple_desc.__isset.tableId &&  tuple_id == tuple_desc.id) {
+        table_ids.insert(tuple_desc.tableId);
+      }
+    }
+  }
+
+  // Collect the tableId for the table sink.
+  if (fragment.__isset.output_sink && fragment.output_sink.__isset.table_sink
+      && fragment.output_sink.type == TDataSinkType::TABLE_SINK) {
+    table_ids.insert(fragment.output_sink.table_sink.target_table_id);
+  }
+
+  // Iterate over all TTableDescriptor(s) and add the ones that are needed.
+  BOOST_FOREACH(const TTableDescriptor& table_desc, desc_tbl_.tableDescriptors) {
+    if (table_ids.find(table_desc.id) == table_ids.end()) continue;
+    thrift_desc_tbl.tableDescriptors.push_back(table_desc);
+    thrift_desc_tbl.__isset.tableDescriptors = true;
+  }
+
+  rpc_params->__set_desc_tbl(thrift_desc_tbl);
+}
 }

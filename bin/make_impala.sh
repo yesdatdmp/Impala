@@ -15,11 +15,10 @@
 
 # Incrementally compiles the BE.
 
-# Exit on reference to uninitialized variable
-set -u
+set -euo pipefail
+trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
 
-# Exit on non-zero return value
-set -e
+: ${IMPALA_TOOLCHAIN=}
 
 BUILD_TESTS=1
 CLEAN=0

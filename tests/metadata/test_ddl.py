@@ -22,17 +22,15 @@ from tests.common.test_result_verifier import *
 from subprocess import call
 from tests.common.test_vector import *
 from tests.common.test_dimensions import ALL_NODES_ONLY
-from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import *
-from tests.common.skip import SkipIfIsilon
-from tests.common.skip import SkipIfS3
-from tests.util.filesystem_utils import WAREHOUSE, IS_DEFAULT_FS
+from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
+from tests.util.filesystem_utils import WAREHOUSE, IS_LOCAL
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(ImpalaTestSuite):
   TEST_DBS = ['ddl_test_db', 'ddl_purge_db', 'alter_table_test_db', 'alter_table_test_db2',
               'function_ddl_test', 'udf_test', 'data_src_test', 'truncate_table_test_db',
-              'test_db', 'alter_purge_db']
+              'test_db', 'alter_purge_db', 'db_with_comment']
 
   @classmethod
   def get_workload(self):
@@ -70,6 +68,7 @@ class TestDdlStatements(ImpalaTestSuite):
       self.hdfs_client.delete_file_dir('test-warehouse/%s' % dir_, recursive=True)
 
   @SkipIfS3.hdfs_client # S3: missing coverage: drop table/partition with PURGE
+  @SkipIfLocal.hdfs_client
   @pytest.mark.execute_serially
   def test_drop_table_with_purge(self):
     """This test checks if the table data is permamently deleted in
@@ -117,6 +116,7 @@ class TestDdlStatements(ImpalaTestSuite):
     self.hdfs_client.delete_file_dir("test-warehouse/data_t3", recursive=True)
 
   @SkipIfS3.hdfs_client # S3: missing coverage: drop table/database
+  @SkipIfLocal.hdfs_client
   @pytest.mark.execute_serially
   def test_drop_cleans_hdfs_dirs(self):
     DDL_TEST_DB = "ddl_test_db"
@@ -158,6 +158,7 @@ class TestDdlStatements(ImpalaTestSuite):
     assert not self.hdfs_client.exists("test-warehouse/{0}/t3/".format(DDL_TEST_DB))
 
   @SkipIfS3.insert # S3: missing coverage: truncate table
+  @SkipIfLocal.hdfs_client
   @pytest.mark.execute_serially
   def test_truncate_cleans_hdfs_files(self):
     TRUNCATE_DB = "truncate_table_test_db"
@@ -218,6 +219,7 @@ class TestDdlStatements(ImpalaTestSuite):
 
   @SkipIfS3.hive
   @SkipIfIsilon.hive
+  @SkipIfLocal.hive
   @pytest.mark.execute_serially
   def test_create_hive_integration(self, vector):
     """Verifies that creating a catalog entity (database, table) in Impala using
@@ -231,7 +233,7 @@ class TestDdlStatements(ImpalaTestSuite):
     # not fail
     self.client.execute("create database if not exists test_db")
     # The database should appear in the catalog (IMPALA-2441)
-    assert 'test_db' in self.client.execute("show databases").data
+    assert 'test_db' in self.all_db_names()
     # Ensure a table can be created in this database from Impala and that it is
     # accessable in both Impala and Hive
     self.client.execute("create table if not exists test_db.test_tbl_in_impala(a int)")
@@ -260,10 +262,11 @@ class TestDdlStatements(ImpalaTestSuite):
     # Drop the database immediately after creation (within a statestore heartbeat) and
     # verify the catalog gets updated properly.
     self.client.execute('drop database ddl_test_db')
-    assert 'ddl_test_db' not in self.client.execute("show databases").data
+    assert 'ddl_test_db' not in self.all_db_names()
 
   # TODO: don't use hdfs_client
   @SkipIfS3.insert # S3: missing coverage: alter table
+  @SkipIfLocal.hdfs_client
   @pytest.mark.execute_serially
   def test_alter_table(self, vector):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -279,6 +282,7 @@ class TestDdlStatements(ImpalaTestSuite):
         multiple_impalad=self._use_multiple_impalad(vector))
 
   @SkipIfS3.hdfs_client # S3: missing coverage: alter table drop partition
+  @SkipIfLocal.hdfs_client
   @pytest.mark.execute_serially
   def test_alter_table_drop_partition_with_purge(self, vector):
     """Verfies whether alter <tbl> drop partition purge actually skips trash"""
@@ -365,13 +369,12 @@ class TestDdlStatements(ImpalaTestSuite):
     create_stmts = [create_ds_stmt, create_tbl_stmt]
     drop_stmts = [drop_tbl_stmt, drop_ds_stmt]
 
-    # Get the impalad to capture metrics
-    impala_cluster = ImpalaCluster()
-    impalad = impala_cluster.get_first_impalad()
+    # The ImpaladService is used to capture metrics
+    service = self.impalad_test_service
 
     # Initial metric values
-    class_cache_hits = impalad.service.get_metric_value(class_cache_hits_metric)
-    class_cache_misses = impalad.service.get_metric_value(class_cache_misses_metric)
+    class_cache_hits = service.get_metric_value(class_cache_hits_metric)
+    class_cache_misses = service.get_metric_value(class_cache_misses_metric)
     # Test with 1 node so we can check the metrics on only the coordinator
     vector.get_value('exec_option')['num_nodes'] = 1
     num_iterations = 2
@@ -381,8 +384,8 @@ class TestDdlStatements(ImpalaTestSuite):
     # Check class cache metrics. Shouldn't have any new cache hits, there should be
     # 2 cache misses for every iteration (jar is loaded by both the FE and BE).
     expected_cache_misses = class_cache_misses + (num_iterations * 2)
-    impalad.service.wait_for_metric_value(class_cache_hits_metric, class_cache_hits)
-    impalad.service.wait_for_metric_value(class_cache_misses_metric,
+    service.wait_for_metric_value(class_cache_hits_metric, class_cache_hits)
+    service.wait_for_metric_value(class_cache_misses_metric,
         expected_cache_misses)
 
     # Test with a table that caches the class
@@ -396,12 +399,12 @@ class TestDdlStatements(ImpalaTestSuite):
         select_stmt, 1)
 
     # Capture metric values and run again, should hit the cache.
-    class_cache_hits = impalad.service.get_metric_value(class_cache_hits_metric)
-    class_cache_misses = impalad.service.get_metric_value(class_cache_misses_metric)
+    class_cache_hits = service.get_metric_value(class_cache_hits_metric)
+    class_cache_misses = service.get_metric_value(class_cache_misses_metric)
     self.create_drop_ddl(vector, "data_src_test", create_stmts, drop_stmts,
         select_stmt, 1)
-    impalad.service.wait_for_metric_value(class_cache_hits_metric, class_cache_hits + 2)
-    impalad.service.wait_for_metric_value(class_cache_misses_metric, class_cache_misses)
+    service.wait_for_metric_value(class_cache_hits_metric, class_cache_hits + 2)
+    service.wait_for_metric_value(class_cache_misses_metric, class_cache_misses)
 
   def create_drop_ddl(self, vector, db_name, create_stmts, drop_stmts, select_stmt,
       num_iterations=3):
@@ -509,17 +512,33 @@ class TestDdlStatements(ImpalaTestSuite):
     assert properties['p2'] == 'val3'
     assert properties[''] == ''
 
+  @pytest.mark.execute_serially
+  def test_create_db_comment(self, vector):
+    DB_NAME = 'db_with_comment'
+    COMMENT = 'A test comment'
+    self._create_db(DB_NAME, sync=True, comment=COMMENT)
+    result = self.client.execute("show databases like '{0}'".format(DB_NAME))
+    assert len(result.data) == 1
+    cols = result.data[0].split('\t')
+    assert len(cols) == 2
+    assert cols[0] == DB_NAME
+    assert cols[1] == COMMENT
+
   @classmethod
   def _use_multiple_impalad(cls, vector):
     return vector.get_value('exec_option')['sync_ddl'] == 1
 
-  def _create_db(self, db_name, sync=False):
+  def _create_db(self, db_name, sync=False, comment=None):
     """Creates a database using synchronized DDL to ensure all nodes have the test
     database available for use before executing the .test file(s).
     """
     impala_client = self.create_impala_client()
     sync and impala_client.set_configuration({'sync_ddl': 1})
-    ddl = "create database {0} location '{1}/{0}.db'".format(db_name, WAREHOUSE)
+    if comment is None:
+      ddl = "create database {0} location '{1}/{0}.db'".format(db_name, WAREHOUSE)
+    else:
+      ddl = "create database {0} comment '{1}' location '{2}/{0}.db'".format(
+        db_name, comment, WAREHOUSE)
     impala_client.execute(ddl)
     impala_client.close()
 

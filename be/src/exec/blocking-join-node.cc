@@ -21,6 +21,7 @@
 #include "runtime/runtime-state.h"
 #include "util/debug-util.h"
 #include "util/runtime-profile.h"
+#include "util/time.h"
 
 #include "gen-cpp/PlanNodes_types.h"
 
@@ -193,9 +194,7 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
     Status open_status = child(0)->Open(state);
 
     // The left/right child overlap stops here.
-    timespec overlap_stops_time;
-    clock_gettime(CLOCK_MONOTONIC, &overlap_stops_time);
-    built_probe_overlap_stop_watch_.SetTimeCeiling(overlap_stops_time);
+    built_probe_overlap_stop_watch_.SetTimeCeiling(MonotonicNanos());
 
     // Blocks until ConstructBuildSide has returned, after which the build side structures
     // are fully constructed.
@@ -212,10 +211,7 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
     RETURN_IF_ERROR(ConstructBuildSide(state));
   } else {
     // The left/right child never overlap. The overlap stops here.
-    timespec overlap_stops_time;
-    clock_gettime(CLOCK_MONOTONIC, &overlap_stops_time);
-    built_probe_overlap_stop_watch_.SetTimeCeiling(overlap_stops_time);
-
+    built_probe_overlap_stop_watch_.SetTimeCeiling(MonotonicNanos());
     RETURN_IF_ERROR(ConstructBuildSide(state));
     RETURN_IF_ERROR(child(0)->Open(state));
   }
@@ -282,7 +278,7 @@ int64_t BlockingJoinNode::LocalTimeCounterFn(const RuntimeProfile::Counter* tota
   // If the child time counter is updated before the parent time counter, then the child
   // time will be greater. Stop watch is not thread safe, which can return invalid value.
   // Don't return a negative number in those cases.
-  return ::max(0L, local_time);
+  return ::max<int64_t>(0, local_time);
 }
 
 // This function is replaced by codegen

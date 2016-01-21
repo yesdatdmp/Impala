@@ -37,7 +37,7 @@
 #include "util/progress-updater.h"
 #include "util/runtime-profile.h"
 #include "runtime/runtime-state.h"
-#include "statestore/simple-scheduler.h"
+#include "scheduling/simple-scheduler.h"
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/Frontend_types.h"
 
@@ -254,13 +254,12 @@ class Coordinator {
   /// owned by plan root, which resides in runtime_state_'s pool
   const RowDescriptor* row_desc_;
 
-  /// map from fragment instance id to corresponding exec state stored in
-  /// backend_exec_states_
-  typedef boost::unordered_map<TUniqueId, BackendExecState*> BackendExecStateMap;
-  BackendExecStateMap backend_exec_state_map_;
-
   /// Returns a local object pool.
   ObjectPool* obj_pool() { return obj_pool_.get(); }
+
+  // Sets the TDescriptorTable(s) for the current fragment.
+  void SetExecPlanDescriptorTable(const TPlanFragment& fragment,
+      TExecPlanFragmentParams* rpc_params);
 
   /// True if execution has completed, false otherwise.
   bool execution_completed_;
@@ -395,10 +394,10 @@ class Coordinator {
   /// Acquires lock_ and updates query_status_ with 'status' if it's not already
   /// an error status, and returns the current query_status_.
   /// Calls CancelInternal() when switching to an error status.
-  /// If failed_fragment is non-null, it is the fragment_id that has failed, used
-  /// for error reporting along with instance_hostname.
-  Status UpdateStatus(const Status& status, const TUniqueId* failed_fragment,
-      const std::string& instance_hostname = "");
+  /// failed_fragment is the fragment_id that has failed, used for error reporting along
+  /// with instance_hostname.
+  Status UpdateStatus(const Status& status, const TUniqueId& failed_fragment,
+      const std::string& instance_hostname);
 
   /// Returns only when either all backends have reported success or the query is in
   /// error. Returns the status of the query.

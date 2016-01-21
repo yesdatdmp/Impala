@@ -19,11 +19,19 @@
 #  - 0 implies that the schema diff is emppty, or that a reference githash was not found.
 #  - 1 implies that the schemas have changed.
 
+set -euo pipefail
+trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+
 . ${IMPALA_HOME}/bin/impala-config.sh > /dev/null 2>&1
-set -ex
 
 DATASET=${1-}
-hdfs dfs -test -e  /test-warehouse/githash.txt || { exit 0; }
-GIT_HASH=$(echo $(hdfs dfs -cat /test-warehouse/githash.txt))
+hdfs dfs -test -e  ${WAREHOUSE_LOCATION_PREFIX}/test-warehouse/githash.txt || { exit 0; }
+GIT_HASH=$(echo $(hdfs dfs -cat ${WAREHOUSE_LOCATION_PREFIX}/test-warehouse/githash.txt))
+if ! git show $GIT_HASH &>/dev/null; then
+  echo The git commit used to create the test warehouse snapshot is not available \
+      locally. Fetching the latest commits from remotes.
+  git fetch --all &>/dev/null
+fi
 # Check whether a non-empty diff exists.
 git diff --exit-code ${GIT_HASH}..HEAD ${IMPALA_HOME}/testdata/datasets/$DATASET
+git diff --exit-code ${GIT_HASH}..HEAD ${IMPALA_HOME}/testdata/avro_schema_resolution

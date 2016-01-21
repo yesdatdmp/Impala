@@ -26,7 +26,7 @@
 #include "exec/read-write-util.h"
 #include "exec/text-converter.inline.h"
 #include "exprs/expr-context.h"
-#include "runtime/array-value-builder.h"
+#include "runtime/collection-value-builder.h"
 #include "runtime/descriptors.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/runtime-state.h"
@@ -143,7 +143,7 @@ int HdfsScanner::GetMemory(MemPool** pool, Tuple** tuple_mem, TupleRow** tuple_r
   return batch_->capacity() - batch_->num_rows();
 }
 
-int HdfsScanner::GetCollectionMemory(ArrayValueBuilder* builder, MemPool** pool,
+int HdfsScanner::GetCollectionMemory(CollectionValueBuilder* builder, MemPool** pool,
     Tuple** tuple_mem, TupleRow** tuple_row_mem) {
   DCHECK(parse_status_.ok()) << "Don't overwrite parse_status_"
       << parse_status_.GetDetail();
@@ -168,13 +168,14 @@ Status HdfsScanner::CommitRows(int num_rows) {
   tuple_mem_ += scan_node_->tuple_desc()->byte_size() * num_rows;
 
   // We need to pass the row batch to the scan node if there is too much memory attached,
-  // which can happen if the query is very selective.
-  if (batch_->AtCapacity() || context_->num_completed_io_buffers() > 0) {
+  // which can happen if the query is very selective. We need to release memory even
+  // if no rows passed predicates.
+  if (batch_->AtCapacity(batch_->tuple_data_pool()) ||
+      context_->num_completed_io_buffers() > 0) {
     context_->ReleaseCompletedResources(batch_, /* done */ false);
     scan_node_->AddMaterializedRowBatch(batch_);
     StartNewRowBatch();
   }
-
   if (context_->cancelled()) return Status::CANCELLED;
   RETURN_IF_ERROR(state_->CheckQueryState());
   // Free local expr allocations for this thread

@@ -18,7 +18,6 @@
 #include <string>
 #include <time.h>
 
-#include <boost/assign/list_of.hpp>
 #include <boost/date_time/c_local_time_adjustor.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/lexical_cast.hpp>
@@ -51,15 +50,11 @@
 
 #include "common/names.h"
 
-DECLARE_int32(be_port);
-DECLARE_int32(beeswax_port);
-DECLARE_string(impalad);
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disable_optimization_passes);
 DECLARE_bool(use_utc_for_unix_timestamp_conversions);
 
 namespace posix_time = boost::posix_time;
-using boost::assign::list_of;
 using boost::bad_lexical_cast;
 using boost::date_time::c_local_adjustor;
 using boost::posix_time::from_time_t;
@@ -312,16 +307,10 @@ class ExprTest : public testing::Test {
 
   // We can't put this into TestValue() because GTest can't resolve
   // the ambiguity in TimestampValue::operator==, even with the appropriate casts.
-  void TestTimestampValue(const string& expr, const TimestampValue& expected_result,
-      const int64_t tolerance_in_seconds = 0) {
+  void TestTimestampValue(const string& expr, const TimestampValue& expected_result) {
     TimestampValue* result;
     GetValue(expr, TYPE_TIMESTAMP, reinterpret_cast<void**>(&result));
-    if (tolerance_in_seconds == 0) {
-      EXPECT_EQ(expected_result, *result);
-    } else {
-      int64_t delta = abs(result->ToUnixTime() - expected_result.ToUnixTime());
-      EXPECT_LE(delta, tolerance_in_seconds);
-    }
+    EXPECT_EQ(expected_result, *result);
   }
 
   // Tests whether the returned TimestampValue is valid.
@@ -330,6 +319,18 @@ class ExprTest : public testing::Test {
     TimestampValue* result;
     GetValue(expr, TYPE_TIMESTAMP, reinterpret_cast<void**>(&result));
     EXPECT_TRUE(result->HasDateOrTime());
+  }
+
+// This macro adds a scoped trace to provide the line number of the caller upon failure.
+#define EXPECT_BETWEEN(start, value, end) { \
+    SCOPED_TRACE(""); \
+    ExpectBetween(start, value, end); \
+  }
+
+  template <typename T>
+  void ExpectBetween(T start, T value, T end) {
+    EXPECT_LE(start, value);
+    EXPECT_LE(value, end);
   }
 
   // Test conversions of Timestamps to and from string/int with values related to the
@@ -536,7 +537,31 @@ class ExprTest : public testing::Test {
     TestValue("1.23 < 1.234", TYPE_BOOLEAN, true);
     TestValue("1.23 > 1.234", TYPE_BOOLEAN, false);
     TestValue("1.23 = 1.230000000000000000000", TYPE_BOOLEAN, true);
-    TestValue("1.2300 != 1.230000000000000000001", TYPE_BOOLEAN, true);
+
+    // Some values are too precise to be stored to full precision as doubles, but not too
+    // precise to be stored as decimals.
+    static const string not_too_precise = "1.25";
+    // The closest double to 'too_precise' is 1.25 - the string as written cannot be
+    // preresented exactly as a double.
+    static const string too_precise = "1.250000000000000000001";
+    TestValue(
+        "cast(" + not_too_precise + " as double) != cast(" + too_precise + " as double)",
+        TYPE_BOOLEAN, false);
+    TestValue(not_too_precise + " != " + too_precise, TYPE_BOOLEAN, true);
+    TestValue("cast(" + not_too_precise + " as double) IS DISTINCT FROM cast(" +
+            too_precise + " as double)",
+        TYPE_BOOLEAN, false);
+    TestValue(not_too_precise + " IS DISTINCT FROM " + too_precise, TYPE_BOOLEAN, true);
+    TestValue("cast(" + not_too_precise + " as double) IS NOT DISTINCT FROM cast(" +
+            too_precise + " as double)",
+        TYPE_BOOLEAN, true);
+    TestValue(
+        not_too_precise + " IS NOT DISTINCT FROM " + too_precise, TYPE_BOOLEAN, false);
+    TestValue(
+        "cast(" + not_too_precise + " as double) <=> cast(" + too_precise + " as double)",
+        TYPE_BOOLEAN, true);
+    TestValue(not_too_precise + " <=> " + too_precise, TYPE_BOOLEAN, false);
+
     TestValue("cast(1 as decimal(38,0)) = cast(1 as decimal(38,37))", TYPE_BOOLEAN, true);
     TestValue("cast(1 as decimal(38,0)) = cast(0.1 as decimal(38,38))",
               TYPE_BOOLEAN, false);
@@ -565,6 +590,47 @@ class ExprTest : public testing::Test {
     TestIsNull("NULL > " + op, TYPE_BOOLEAN);
     TestIsNull("NULL <= " + op, TYPE_BOOLEAN);
     TestIsNull("NULL >= " + op, TYPE_BOOLEAN);
+  }
+
+  // Test IS DISTINCT FROM operator and its variants
+  void TestDistinctFrom() {
+    static const string operators[] = {"<=>", "IS DISTINCT FROM", "IS NOT DISTINCT FROM"};
+    static const string types[] = {"Boolean", "TinyInt", "SmallInt", "Int", "BigInt",
+        "Float", "Double", "String", "Timestamp", "Decimal"};
+    static const string operands1[] = {
+        "true", "cast(1 as TinyInt)", "cast(1 as SmallInt)", "cast(1 as Int)",
+        "cast(1 as BigInt)", "cast(1 as Float)", "cast(1 as Double)",
+        "'this is a string'", "cast(1 as TimeStamp)", "cast(1 as Decimal)"
+    };
+    static const string operands2[] = {
+        "false", "cast(2 as TinyInt)", "cast(2 as SmallInt)", "cast(2 as Int)",
+        "cast(2 as BigInt)", "cast(2 as Float)", "cast(2 as Double)",
+        "'this is ALSO a string'", "cast(2 as TimeStamp)", "cast(2 as Decimal)"
+    };
+    for (int i = 0; i < sizeof(operators) / sizeof(string); ++i) {
+      // "IS DISTINCT FROM" and "<=>" are generalized equality, and
+      // this fact is recorded in is_equal.
+      const bool is_equal = operators[i] != "IS DISTINCT FROM";
+      // Everything IS NOT DISTINCT FROM itself.
+      for (int j = 0; j < sizeof(types) / sizeof(string); ++j) {
+        const string operand = "cast(NULL as " + types[j] + ")";
+        TestValue(operand + ' ' + operators[i] + ' ' + operand, TYPE_BOOLEAN, is_equal);
+      }
+      for (int j = 0; j < sizeof(operands1) / sizeof(string); ++j) {
+        TestValue(operands1[j] + ' ' + operators[i] + ' ' + operands1[j], TYPE_BOOLEAN,
+                  is_equal);
+      }
+      // NULL IS DISTINCT FROM all non-null things.
+      for (int j = 0; j < sizeof(operands1) / sizeof(string); ++j) {
+        TestValue("NULL " + operators[i] + ' ' + operands1[j], TYPE_BOOLEAN, !is_equal);
+        TestValue(operands1[j] + ' ' + operators[i] + " NULL", TYPE_BOOLEAN, !is_equal);
+      }
+      // Non-null values can be DISTINCT.
+      for (int j = 0; j < sizeof(operands1) / sizeof(string); ++j) {
+        TestValue(operands1[j] + ' ' + operators[i] + ' ' + operands2[j], TYPE_BOOLEAN,
+                  !is_equal);
+      }
+    }
   }
 
   // Test comparison operators with a left or right NULL operand on all types.
@@ -1180,6 +1246,7 @@ TEST_F(ExprTest, BinaryPredicates) {
   TestStringComparisons();
   TestDecimalComparisons();
   TestNullComparisons();
+  TestDistinctFrom();
 }
 
 // Test casting from all types to all other types
@@ -2198,6 +2265,40 @@ TEST_F(ExprTest, StringParseUrlFunction) {
   // Missing protocol.
   TestIsNull("parse_url('example.com/docs/books/tutorial/"
       "index.html?name=networking#DOWNLOADING', 'HOST')", TYPE_STRING);
+
+  // IMPALA-1170: '@' character in PATH
+  TestStringValue("parse_url('http://example.com/index.html@Top2,Right1',"
+      "'HOST')", "example.com");
+  TestStringValue("parse_url('http://user:pass@example.com/index.html@Top2,Right1',"
+      "'HOST')", "example.com");
+  TestStringValue("parse_url('http://user:pass@example.com/index.html?mail=foo@bar',"
+      "'HOST')", "example.com");
+  // '@' in path
+  TestStringValue("parse_url('http://example.com/index.html@Top2,Right1',"
+      "'FILE')", "/index.html@Top2,Right1");
+  TestStringValue("parse_url('http://user:pass@example.com/index.html@Top2,Right1',"
+      "'FILE')", "/index.html@Top2,Right1");
+  // '@' in query
+  TestStringValue("parse_url('http://example.com/index.html@Top2,Right1?foo@bar',"
+      "'QUERY')", "foo@bar");
+  TestStringValue("parse_url('http://user:pass@example.com/index.html@Top2,Right1?foo@bar',"
+      "'QUERY')", "foo@bar");
+  // '?' before '/'
+  TestStringValue("parse_url('http://user:pass@example.com?dir=/etc',"
+      "'HOST')", "example.com");
+  TestStringValue("parse_url('http://user:pass@example.com?dir=/etc',"
+      "'QUERY')", "dir=/etc");
+  // '@' in forbidden places
+  // TODO: Return NULL for invalid URLs like the ones below. Our parser currently does not
+  // validate URLs.
+  TestStringValue("parse_url('htt@p://example.com/docs',"
+      "'PROTOCOL')", "htt@p");
+  TestStringValue("parse_url('htt@p://example.com/docs',"
+      "'HOST')", "example.com");
+  TestStringValue("parse_url('http://foo@baa@example.com/docs',"
+      "'HOST')", "baa@example.com");
+  TestStringValue("parse_url('http://foo@baa@example.com/docs',"
+      "'USERINFO')", "foo");
 
   // PATH part.
   TestStringValue("parse_url('http://user:pass@example.com:80/docs/books/tutorial/"
@@ -3594,30 +3695,44 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValidTimestampValue("current_timestamp()");
   TestValidTimestampValue("cast(unix_timestamp() as timestamp)");
 
-  // Test that the epoch is reasonable. Allow a few seconds to compensate for execution
-  // time.
-  int tolerance_in_seconds = 5;
-  time_t unix_time = (posix_time::microsec_clock::local_time() - from_time_t(0))
-      .total_seconds();
-  stringstream expr_sql;
-  expr_sql << "unix_timestamp() between " << unix_time - tolerance_in_seconds
-      << " and " << unix_time + tolerance_in_seconds;
-  TestValue(expr_sql.str(), TYPE_BOOLEAN, true);
+  // Test that the epoch is reasonable. The default behavior of UNIX_TIMESTAMP()
+  // is incorrect but wasn't changed for compatibility reasons. The function returns
+  // a value as though the current timezone is UTC. Or in other words, 1970-01-01
+  // in the current timezone is the effective epoch. A flag was introduced to enable
+  // the correct behavior. The first test below checks the default/incorrect behavior.
+  time_t unix_start_time =
+      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
+  int64_t* unix_timestamp_result;
+  GetValue("unix_timestamp()", TYPE_BIGINT,
+      reinterpret_cast<void**>(&unix_timestamp_result));
+  EXPECT_BETWEEN(unix_start_time, *unix_timestamp_result, static_cast<int64_t>(
+      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds()));
+
+  // Check again with the flag enabled.
   {
     ScopedLocalUnixTimestampConversionOverride use_local;
-    unix_time = time(NULL);
-    expr_sql.str("");
-    expr_sql << "unix_timestamp() between " << unix_time - tolerance_in_seconds
-        << " and " << unix_time + tolerance_in_seconds;
-    TestValue(expr_sql.str(), TYPE_BOOLEAN, true);
+    unix_start_time = time(NULL);
+    GetValue("unix_timestamp()", TYPE_BIGINT,
+        reinterpret_cast<void**>(&unix_timestamp_result));
+    EXPECT_BETWEEN(unix_start_time, *unix_timestamp_result, time(NULL));
   }
+
   // Test that the other current time functions are also reasonable.
-  ptime local_time = c_local_adjustor<ptime>::utc_to_local(from_time_t(unix_time));
-  TestTimestampValue("now()", TimestampValue(local_time), tolerance_in_seconds);
-  TestTimestampValue("current_timestamp()", TimestampValue(local_time),
-      tolerance_in_seconds);
-  TestTimestampValue("cast(unix_timestamp() as timestamp)", TimestampValue(local_time),
-      tolerance_in_seconds);
+  TimestampValue* timestamp_result;
+  TimestampValue start_time = TimestampValue::LocalTime();
+  GetValue("now()", TYPE_TIMESTAMP, reinterpret_cast<void**>(&timestamp_result));
+  EXPECT_BETWEEN(start_time, *timestamp_result, TimestampValue::LocalTime());
+  GetValue("current_timestamp()", TYPE_TIMESTAMP,
+      reinterpret_cast<void**>(&timestamp_result));
+  EXPECT_BETWEEN(start_time, *timestamp_result, TimestampValue::LocalTime());
+  // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
+  // a second to ensure an earlier value.
+  unix_start_time =
+      (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
+  GetValue("cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP,
+      reinterpret_cast<void**>(&timestamp_result));
+  EXPECT_BETWEEN(TimestampValue(unix_start_time - 1), *timestamp_result,
+      TimestampValue::LocalTime());
 
   // Test alias
   TestValue("now() = current_timestamp()", TYPE_BOOLEAN, true);
@@ -4094,6 +4209,13 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestError("from_timestamp(cast('2012-02-28 11:10:11+0530' as timestamp), 'yyyy-MM-dd HH:mm:ss+hhdd')");
   TestError("from_timestamp(cast('2012-02-28+0530' as timestamp), 'yyyy-MM-dd+hhmm')");
   TestError("from_timestamp(cast('10:00:00+0530 2010-01-01' as timestamp), 'HH:mm:ss+hhmm yyyy-MM-dd')");
+
+  // Regression test for IMPALA-2732, can't parse custom date formats with non-zero-padded
+  // values
+  TestValue("unix_timestamp('12/2/2015', 'MM/d/yyyy')", TYPE_BIGINT, 1449014400);
+  TestIsNull("unix_timestamp('12/2/2015', 'MM/dd/yyyy')", TYPE_BIGINT);
+  TestValue("unix_timestamp('12/31/2015', 'MM/d/yyyy')", TYPE_BIGINT, 1451520000);
+  TestValue("unix_timestamp('12/31/2015', 'MM/dd/yyyy')", TYPE_BIGINT, 1451520000);
 }
 
 TEST_F(ExprTest, ConditionalFunctions) {
@@ -4533,7 +4655,7 @@ TEST_F(ExprTest, ResultsLayoutTest) {
     exprs.clear();
     expected_offsets.clear();
     // With one expr, all offsets should be 0.
-    expected_offsets[t.GetByteSize()] = list_of(0);
+    expected_offsets[t.GetByteSize()] = set<int>({0});
     exprs.push_back(pool.Add(Literal::CreateLiteral(t, "0")));
     if (t.IsVarLenStringType()) {
       ValidateLayout(exprs, 16, 0, expected_offsets);
@@ -5591,17 +5713,12 @@ int main(int argc, char **argv) {
 
   // Create an in-process Impala server and in-process backends for test environment
   // without any startup validation check
-  FLAGS_impalad = "localhost:21000";
   FLAGS_abort_on_config_error = false;
   VLOG_CONNECTION << "creating test env";
   VLOG_CONNECTION << "starting backends";
-  InProcessImpalaServer* impala_server =
-      new InProcessImpalaServer("localhost", FLAGS_be_port, 0, 0, "", 0);
-  EXIT_IF_ERROR(
-      impala_server->StartWithClientServers(FLAGS_beeswax_port, FLAGS_beeswax_port + 1,
-                                            false));
-  impala_server->SetCatalogInitialized();
-  executor_ = new ImpaladQueryExecutor();
+  InProcessImpalaServer* impala_server = InProcessImpalaServer::StartWithEphemeralPorts();
+  executor_ = new ImpaladQueryExecutor(impala_server->hostname(),
+      impala_server->beeswax_port());
   EXIT_IF_ERROR(executor_->Setup());
 
   vector<string> options;

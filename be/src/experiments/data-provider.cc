@@ -1,4 +1,6 @@
 #include "experiments/data-provider.h"
+
+#include <algorithm>
 #include <stdlib.h>
 #include <math.h>
 #include <iostream>
@@ -9,6 +11,7 @@ using boost::minstd_rand;
 using boost::uniform_real;
 using boost::variate_generator;
 using namespace impala;
+using std::min;
 
 DataProvider::DataProvider(MemPool* pool, RuntimeProfile* profile) :
   pool_(pool),
@@ -33,7 +36,7 @@ void DataProvider::Reset(int num_rows, int batch_size, const vector<DataProvider
     row_size_ += cols[i].bytes;
   }
   data_.reset(new char[row_size_ * batch_size_]);
-  COUNTER_SET(bytes_generated_, 0L);
+  COUNTER_SET(bytes_generated_, 0);
 }
 
 void DataProvider::SetSeed(int seed) {

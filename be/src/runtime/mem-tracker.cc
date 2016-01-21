@@ -20,7 +20,7 @@
 
 #include "runtime/exec-env.h"
 #include "resourcebroker/resource-broker.h"
-#include "statestore/query-resource-mgr.h"
+#include "scheduling/query-resource-mgr.h"
 #include "util/debug-util.h"
 #include "util/mem-info.h"
 #include "util/pretty-printer.h"
@@ -107,6 +107,7 @@ MemTracker::MemTracker(UIntGauge* consumption_metric,
 }
 
 void MemTracker::Init() {
+  DCHECK_GE(limit_, -1);
   DCHECK(rm_reserved_limit_ == -1 || limit_ == -1 || rm_reserved_limit_ <= limit_);
   // populate all_trackers_ and limit_trackers_
   MemTracker* tracker = this;
@@ -201,7 +202,7 @@ MemTracker::~MemTracker() {
 }
 
 void MemTracker::RegisterMetrics(MetricGroup* metrics, const string& prefix) {
-  num_gcs_metric_ = metrics->AddCounter(Substitute("$0.num-gcs", prefix), 0L);
+  num_gcs_metric_ = metrics->AddCounter<int64_t>(Substitute("$0.num-gcs", prefix), 0);
 
   // TODO: Consider a total amount of bytes freed counter
   bytes_freed_by_last_gc_metric_ = metrics->AddGauge<int64_t>(

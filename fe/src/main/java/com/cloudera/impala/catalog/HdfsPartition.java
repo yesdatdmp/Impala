@@ -47,6 +47,7 @@ import com.cloudera.impala.util.HdfsCachingUtil;
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
@@ -64,7 +65,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    * Metadata for a single file in this partition.
    * TODO: Do we even need this class? Just get rid of it and use the Thrift version?
    */
-  static public class FileDescriptor {
+  static public class FileDescriptor implements Comparable<FileDescriptor> {
     private final THdfsFileDesc fileDescriptor_;
 
     public String getFileName() { return fileDescriptor_.getFile_name(); }
@@ -114,6 +115,14 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       return Objects.toStringHelper(this)
           .add("FileName", getFileName())
           .add("Length", getFileLength()).toString();
+    }
+
+    /**
+     * Orders file descriptors lexicographically by file name.
+     */
+    @Override
+    public int compareTo(FileDescriptor otherFd) {
+      return getFileName().compareTo(otherFd.getFileName());
     }
   }
 
@@ -608,6 +617,22 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       .toString();
   }
 
+  private static Predicate<String> isIncrementalStatsKey = new Predicate<String>() {
+    @Override
+    public boolean apply(String key) {
+      return !(key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_NUM_CHUNKS)
+          || key.startsWith(PartitionStatsUtil.INCREMENTAL_STATS_CHUNK_PREFIX));
+    }
+  };
+
+  /**
+   * Returns hmsParameters_ after filtering out all the partition
+   * incremental stats information.
+   */
+  private Map<String, String> getFilteredHmsParameters() {
+    return Maps.filterKeys(hmsParameters_, isIncrementalStatsKey);
+  }
+
   public static HdfsPartition fromThrift(HdfsTable table,
       long id, THdfsPartition thriftPartition) {
     HdfsStorageDescriptor storageDesc = new HdfsStorageDescriptor(table.getName(),
@@ -686,7 +711,8 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     }
   }
 
-  public THdfsPartition toThrift(boolean includeFileDesc) {
+  public THdfsPartition toThrift(boolean includeFileDesc,
+      boolean includeIncrementalStats) {
     List<TExpr> thriftExprs = Expr.treesToThrift(getPartitionValues());
 
     THdfsPartition thriftHdfsPart = new THdfsPartition(
@@ -702,7 +728,8 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     thriftHdfsPart.setAccess_level(accessLevel_);
     thriftHdfsPart.setIs_marked_cached(isMarkedCached_);
     thriftHdfsPart.setId(getId());
-    thriftHdfsPart.setHms_parameters(hmsParameters_);
+    thriftHdfsPart.setHms_parameters(
+        includeIncrementalStats ? hmsParameters_ : getFilteredHmsParameters());
     if (includeFileDesc) {
       // Add block location information
       for (FileDescriptor fd: fileDescriptors_) {

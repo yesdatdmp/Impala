@@ -231,6 +231,7 @@ public class ParserTest {
     ParsesOk("select 1--");
     ParsesOk("select 1 --foo");
     ParsesOk("select 1 --\ncol_name");
+    ParsesOk("--foo's \nselect 1 --bar");
     ParsesOk("--foo\nselect 1 --bar");
     ParsesOk("--foo\r\nselect 1 --bar");
     ParsesOk("--/* foo */\n select 1");
@@ -2383,6 +2384,16 @@ public class ParserTest {
     // Column and partition definitions not allowed
     ParserError("CREATE TABLE Foo(i int) AS SELECT 1");
     ParserError("CREATE TABLE Foo PARTITIONED BY(i int) AS SELECT 1");
+
+    // Partitioned by syntax following insert into syntax
+    ParsesOk("CREATE TABLE Foo PARTITIONED BY (a) AS SELECT 1");
+    ParsesOk("CREATE TABLE Foo PARTITIONED BY (a) ROW FORMAT DELIMITED STORED AS " +
+        "PARQUETFILE AS SELECT 1");
+    ParsesOk("CREATE TABLE Foo PARTITIONED BY (a) AS SELECT 1, 2");
+    ParsesOk("CREATE TABLE Foo PARTITIONED BY (a) AS SELECT * from Bar");
+    ParsesOk("CREATE TABLE Foo PARTITIONED BY (a, b) AS SELECT * from Bar");
+    ParserError("CREATE TABLE Foo PARTITIONED BY (a=2, b) AS SELECT * from Bar");
+    ParserError("CREATE TABLE Foo PARTITIONED BY (a, b=2) AS SELECT * from Bar");
   }
 
   @Test
@@ -2758,7 +2769,8 @@ public class ParserTest {
   public void TestSubqueries() {
     // Binary nested predicates
     String subquery = "(SELECT count(*) FROM bar)";
-    String[] operators = {"=", "!=", "<>", ">", ">=", "<", "<="};
+    String[] operators = {"=", "!=", "<>", ">", ">=", "<", "<=", "<=>",
+      "IS DISTINCT FROM", "IS NOT DISTINCT FROM"};
     for (String op: operators) {
       ParsesOk(String.format("SELECT * FROM foo WHERE a %s %s", op, subquery));
       ParsesOk(String.format("SELECT * FROM foo WHERE %s %s a", subquery, op));

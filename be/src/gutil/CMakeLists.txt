@@ -64,11 +64,14 @@ ADD_LIBRARY(gutil
 ./hash/hash.cc
 ./hash/jenkins.cc
 ./hash/city.cc
-./utf/rune.c
+./utf/rune.cc
 )
+
+
 
 # Disable warnings which trigger a lot in the Google code:
 SET_TARGET_PROPERTIES(gutil PROPERTIES
   COMPILE_FLAGS "${CXX_COMMON_FLAGS} -funsigned-char -Wno-deprecated -Wno-char-subscripts -fPIC")
 
+TARGET_LINK_LIBRARIES(gutil glogstatic gflagsstatic)
 SET(GUTIL_LIBS gutil)

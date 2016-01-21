@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Copyright 2012 Cloudera Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,10 +16,10 @@
 # Starts up a Catalog Service with the specified command line arguments. An optional
 # -build_type parameter can be passed to determine the build type to use.
 
-set -e
-set -u
+set -euo pipefail
+trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
 
-BUILD_TYPE=debug
+BUILD_TYPE=latest
 CATALOGD_ARGS=""
 BINARY_BASE_DIR=${IMPALA_HOME}/be/build
 JVM_DEBUG_PORT=""
@@ -35,6 +35,8 @@ do
       ;;
     -build_type=release)
       BUILD_TYPE=release
+      ;;
+    -build_type=latest)
       ;;
     -build_type=*)
       echo "Invalid build type. Valid values are: debug, release"
@@ -54,8 +56,7 @@ do
   esac
 done
 
-# Temporarily disable unbound variable checking in case JAVA_TOOL_OPTIONS is not set.
-set +u
+: ${JAVA_TOOL_OPTIONS=}
 # Optionally enable Java debugging.
 if [ -n "$JVM_DEBUG_PORT" ]; then
   export JAVA_TOOL_OPTIONS="-agentlib:jdwp=transport=dt_socket,address=localhost:${JVM_DEBUG_PORT},server=y,suspend=${JVM_SUSPEND} ${JAVA_TOOL_OPTIONS}"
@@ -75,8 +76,6 @@ if ${CLUSTER_DIR}/admin is_kerberized; then
       CATALOGD_ARGS="${CATALOGD_ARGS} -krb5_debug_file=/tmp/catalogd.krb5_debug"
   fi
 fi
-
-set -u
 
 . ${IMPALA_HOME}/bin/set-classpath.sh
 exec ${BINARY_BASE_DIR}/${BUILD_TYPE}/catalog/catalogd ${CATALOGD_ARGS}

@@ -465,14 +465,17 @@ class HdfsScanNode : public ScanNode {
   void ThreadTokenAvailableCb(ThreadResourceMgr::ResourcePool* pool);
 
   /// Create and prepare new scanner for this partition type.
-  /// If the scanner cannot be created, return NULL.
-  HdfsScanner* CreateAndPrepareScanner(HdfsPartitionDescriptor* partition_desc,
-      ScannerContext* context, Status* status);
+  /// If the scanner is successfully created, it is returned in 'scanner'.
+  Status CreateAndPrepareScanner(HdfsPartitionDescriptor* partition,
+      ScannerContext* context, boost::scoped_ptr<HdfsScanner>* scanner);
 
   /// Main function for scanner thread. This thread pulls the next range to be
   /// processed from the IoMgr and then processes the entire range end to end.
   /// This thread terminates when all scan ranges are complete or an error occurred.
   void ScannerThread();
+
+  /// Process the entire scan range with a new scanner object. Executed in scanner thread.
+  Status ProcessSplit(DiskIoMgr::ScanRange* scan_range);
 
   /// Returns true if there is enough memory (against the mem tracker limits) to
   /// have a scanner thread.
@@ -496,16 +499,16 @@ class HdfsScanNode : public ScanNode {
   /// This must be called on Close() to unregister counters.
   void StopAndFinalizeCounters();
 
-  /// Recursively initializes all NULL collection slots to an empty ArrayValue in
+  /// Recursively initializes all NULL collection slots to an empty CollectionValue in
   /// addition to maintaining the null bit. Hack to allow UnnestNode to project out
   /// collection slots. Assumes that the null bit has already been un/set.
   /// TODO: remove this function once the TODOs in UnnestNode regarding projection
   /// have been addressed.
-  void InitNullArrayValues(const TupleDescriptor* tuple_desc, Tuple* tuple) const;
+  void InitNullCollectionValues(const TupleDescriptor* tuple_desc, Tuple* tuple) const;
 
-  /// Helper to call InitNullArrayValues() on all tuples produced by this scan
+  /// Helper to call InitNullCollectionValues() on all tuples produced by this scan
   /// in 'row_batch'.
-  void InitNullArrayValues(RowBatch* row_batch) const;
+  void InitNullCollectionValues(RowBatch* row_batch) const;
 };
 
 }

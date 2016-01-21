@@ -14,19 +14,42 @@
 
 cmake_minimum_required(VERSION 2.6)
 
+if (NOT $ENV{DISABLE_IMPALA_TOOLCHAIN})
+  # Enable toolchain variable if the environment is setup
+  set(IMPALA_TOOLCHAIN ON)
+  message(STATUS "Toolchain build.")
+  # If the toolchain directory does not yet exists, we assume that the dependencies
+  # should be downloaded. If the download script is not available fail the
+  # configuration.
+  if (NOT IS_DIRECTORY $ENV{IMPALA_TOOLCHAIN})
+    set(BOOTSTRAP_CMD "$ENV{IMPALA_HOME}/bin/bootstrap_toolchain.py")
+    # Download and unpack the dependencies
+    message(STATUS "Downloading and extracting dependencies.")
+    execute_process(COMMAND ${BOOTSTRAP_CMD} RESULT_VARIABLE BOOTSTRAP_RESULT)
+    if (${BOOTSTRAP_RESULT} EQUAL 0)
+      message(STATUS "Toolchain bootstrap complete.")
+    else()
+      message(FATAL_ERROR "Toolchain bootstrap failed.")
+    endif()
+  else()
+    message(STATUS "Impala toolchain picked up at $ENV{IMPALA_TOOLCHAIN}")
+  endif()
+else()
+  set(IMPALA_TOOLCHAIN OFF)
+  message(STATUS "Impala toolchain was explicitly disabled using DISABLE_IMPALA_TOOLCHAIN.")
+  message(STATUS "Assuming system search path for dependencies.")
+endif()
+
+# Explicitly define project() to allow modifying the compiler before the project is
+# initialized.
+project(Impala)
+
 if (NOT DEFINED BUILD_SHARED_LIBS)
   set(BUILD_SHARED_LIBS OFF)
 endif()
 
 # Build compile commands database
-set(CMAKE_EXPORT_COMPILE_COMMNDS ON)
-
-# Enable toolchain variable if the environment is setup
-if (NOT IMPALA_TOOLCHAIN)
-   message(STATUS "Regular build.")
-else()
-   message(STATUS "Toolchain build.")
-endif()
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # generate CTest input files
 enable_testing()
@@ -58,9 +81,9 @@ if (IMPALA_TOOLCHAIN)
   # Define root path for all dependencies, this is in the form of
   # set_dep_root(PACKAGE) ->
   #   PACKAGE_ROOT set to $ENV{IMPALA_TOOLCHAIN}/PACKAGE-$ENV{IMPALA_PACKAGE_VERSION}
+  set_dep_root(GCC)
   set_dep_root(AVRO)
   set_dep_root(BZIP2)
-  set_dep_root(CYRUS_SASL)
   set_dep_root(GFLAGS)
   set_dep_root(GLOG)
   set_dep_root(GPERFTOOLS)
@@ -73,6 +96,9 @@ if (IMPALA_TOOLCHAIN)
   set_dep_root(SNAPPY)
   set_dep_root(THRIFT)
   set_dep_root(ZLIB)
+  if (APPLE)
+    set_dep_root(OPENSSL)
+  endif()
 endif ()
 
 # find libraries that will be statically linked if they were compiled with -fPIC
@@ -191,7 +217,9 @@ set(LIBS ${LIBS} ${LLVM_MODULE_LIBS})
 # find Sasl
 find_package(Sasl REQUIRED)
 include_directories(${SASL_INCLUDE_DIR})
-set(SASL_LIBRARY saslstatic)
+add_library(sasllib SHARED IMPORTED)
+set_target_properties(sasllib PROPERTIES IMPORTED_LOCATION ${SASL_SHARED_LIB})
+set(SASL_LIBRARY sasllib)
 message(STATUS "Sasl include dir: " ${SASL_INCLUDE_DIR})
 message(STATUS "Sasl library: " ${SASL_LIBRARY})
 
@@ -278,3 +306,5 @@ add_custom_target(loadtestdata
 add_custom_target(benchmark_run
   COMMAND ${CMAKE_SOURCE_DIR}/be/bin/run_hive_benchmark.py
 )
+
+SET(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libstdc++")

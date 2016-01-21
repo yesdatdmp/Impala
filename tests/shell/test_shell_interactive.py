@@ -27,6 +27,7 @@ import sys
 from impala_shell_results import get_shell_cmd_result
 from subprocess import Popen, PIPE
 from tests.common.impala_service import ImpaladService
+from tests.common.skip import SkipIfLocal
 from time import sleep
 
 SHELL_CMD = "%s/bin/impala-shell.sh" % os.environ['IMPALA_HOME']
@@ -116,7 +117,8 @@ class TestImpalaShellInteractive(object):
     self._send_cmd_to_shell(p, command)
     sleep(3)
     os.kill(p.pid, signal.SIGINT)
-    get_shell_cmd_result(p)
+    result = get_shell_cmd_result(p)
+    assert "Cancelled" not in result.stderr
     assert impalad.wait_for_num_in_flight_queries(0)
 
   @pytest.mark.execute_serially
@@ -146,6 +148,7 @@ class TestImpalaShellInteractive(object):
     result = run_impala_shell_interactive(args)
     assert "Executed in" in result.stderr
 
+  @SkipIfLocal.multiple_impalad
   @pytest.mark.execute_serially
   def test_reconnect(self):
     """Regression Test for IMPALA-1235

@@ -14,6 +14,9 @@
 
 #include "exec/hash-table.inline.h"
 
+#include <functional>
+#include <numeric>
+
 #include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
 #include "exprs/expr.h"
@@ -35,9 +38,6 @@ using namespace llvm;
 DEFINE_bool(enable_quadratic_probing, true, "Enable quadratic probing hash table");
 
 const char* HashTableCtx::LLVM_CLASS_NAME = "class.impala::HashTableCtx";
-
-// Page sizes used only for BE test. For non-testing, we use the io buffer size.
-static const int64_t TEST_PAGE_SIZE = 8 * 1024 * 1024;
 
 // Random primes to multiply the seed with.
 static uint32_t SEED_PRIMES[] = {
@@ -80,17 +80,21 @@ static int64_t NULL_VALUE[] = { HashUtil::FNV_SEED, HashUtil::FNV_SEED,
 static const int64_t INITIAL_DATA_PAGE_SIZES[] = { 64 * 1024, 512 * 1024 };
 static const int NUM_SMALL_DATA_PAGES = sizeof(INITIAL_DATA_PAGE_SIZES) / sizeof(int64_t);
 
-HashTableCtx::HashTableCtx(const vector<ExprContext*>& build_expr_ctxs,
-    const vector<ExprContext*>& probe_expr_ctxs, bool stores_nulls, bool finds_nulls,
-    int32_t initial_seed, int max_levels, int num_build_tuples)
+HashTableCtx::HashTableCtx(const std::vector<ExprContext*>& build_expr_ctxs,
+    const std::vector<ExprContext*>& probe_expr_ctxs, bool stores_nulls,
+    const std::vector<bool>& finds_nulls, int32_t initial_seed,
+    int max_levels, int num_build_tuples)
     : build_expr_ctxs_(build_expr_ctxs),
       probe_expr_ctxs_(probe_expr_ctxs),
       stores_nulls_(stores_nulls),
       finds_nulls_(finds_nulls),
+      finds_some_nulls_(std::accumulate(
+          finds_nulls_.begin(), finds_nulls_.end(), false, std::logical_or<bool>())),
       level_(0),
       row_(reinterpret_cast<TupleRow*>(malloc(sizeof(Tuple*) * num_build_tuples))) {
   // Compute the layout and buffer size to store the evaluated expr results
   DCHECK_EQ(build_expr_ctxs_.size(), probe_expr_ctxs_.size());
+  DCHECK_EQ(build_expr_ctxs_.size(), finds_nulls_.size());
   DCHECK(!build_expr_ctxs_.empty());
   results_buffer_size_ = Expr::ComputeResultsLayout(build_expr_ctxs_,
       &expr_values_buffer_offsets_, &var_result_begin_);
@@ -173,7 +177,7 @@ bool HashTableCtx::Equals(TupleRow* build_row) {
   for (int i = 0; i < build_expr_ctxs_.size(); ++i) {
     void* val = build_expr_ctxs_[i]->GetValue(build_row);
     if (val == NULL) {
-      if (!stores_nulls_) return false;
+      if (!(stores_nulls_ && finds_nulls_[i])) return false;
       if (!expr_value_null_bits_[i]) return false;
       continue;
     } else {
@@ -190,15 +194,22 @@ bool HashTableCtx::Equals(TupleRow* build_row) {
 
 const double HashTable::MAX_FILL_FACTOR = 0.75f;
 
-HashTable::HashTable(RuntimeState* state, BufferedBlockMgr::Client* client,
-    int num_build_tuples, BufferedTupleStream* stream, int64_t max_num_buckets,
-    int64_t num_buckets)
+HashTable* HashTable::Create(RuntimeState* state,
+    BufferedBlockMgr::Client* client, int num_build_tuples,
+    BufferedTupleStream* tuple_stream, int64_t max_num_buckets,
+    int64_t initial_num_buckets) {
+  return new HashTable(FLAGS_enable_quadratic_probing, state, client,
+      num_build_tuples, tuple_stream, max_num_buckets, initial_num_buckets);
+}
+
+HashTable::HashTable(bool quadratic_probing, RuntimeState* state,
+    BufferedBlockMgr::Client* client, int num_build_tuples, BufferedTupleStream* stream,
+    int64_t max_num_buckets, int64_t num_buckets)
   : state_(state),
     block_mgr_client_(client),
     tuple_stream_(stream),
-    data_page_pool_(NULL),
     stores_tuples_(num_build_tuples == 1),
-    quadratic_probing_(FLAGS_enable_quadratic_probing),
+    quadratic_probing_(quadratic_probing),
     total_data_page_size_(0),
     next_node_(NULL),
     node_remaining_current_page_(0),
@@ -215,44 +226,18 @@ HashTable::HashTable(RuntimeState* state, BufferedBlockMgr::Client* client,
   DCHECK_EQ((num_buckets & (num_buckets-1)), 0) << "num_buckets must be a power of 2";
   DCHECK_GT(num_buckets, 0) << "num_buckets must be larger than 0";
   DCHECK(stores_tuples_ || stream != NULL);
-}
-
-HashTable::HashTable(MemPool* pool, bool quadratic_probing, int num_buckets)
-  : state_(NULL),
-    block_mgr_client_(NULL),
-    tuple_stream_(NULL),
-    data_page_pool_(pool),
-    stores_tuples_(true),
-    quadratic_probing_(quadratic_probing),
-    total_data_page_size_(0),
-    next_node_(NULL),
-    node_remaining_current_page_(0),
-    num_duplicate_nodes_(0),
-    max_num_buckets_(-1),
-    buckets_(NULL),
-    num_buckets_(num_buckets),
-    num_filled_buckets_(0),
-    num_buckets_with_duplicates_(0),
-    num_build_tuples_(1),
-    has_matches_(false),
-    num_probes_(0), num_failed_probes_(0), travel_length_(0), num_hash_collisions_(0),
-    num_resizes_(0) {
-  DCHECK_EQ((num_buckets & (num_buckets-1)), 0) << "num_buckets must be a power of 2";
-  DCHECK_GT(num_buckets, 0) << "num_buckets must be larger than 0";
-  bool ret = Init();
-  DCHECK(ret);
+  DCHECK(client != NULL);
 }
 
 bool HashTable::Init() {
   int64_t buckets_byte_size = num_buckets_ * sizeof(Bucket);
-  if (block_mgr_client_ != NULL &&
-      !state_->block_mgr()->ConsumeMemory(block_mgr_client_, buckets_byte_size)) {
+  if (!state_->block_mgr()->ConsumeMemory(block_mgr_client_, buckets_byte_size)) {
     num_buckets_ = 0;
     return false;
   }
   buckets_ = reinterpret_cast<Bucket*>(malloc(buckets_byte_size));
   memset(buckets_, 0, buckets_byte_size);
-  return GrowNodeArray();
+  return true;
 }
 
 void HashTable::Close() {
@@ -270,10 +255,7 @@ void HashTable::Close() {
   }
   data_pages_.clear();
   if (buckets_ != NULL) free(buckets_);
-  if (block_mgr_client_ != NULL) {
-    state_->block_mgr()->ReleaseMemory(block_mgr_client_,
-        num_buckets_ * sizeof(Bucket));
-  }
+  state_->block_mgr()->ReleaseMemory(block_mgr_client_, num_buckets_ * sizeof(Bucket));
 }
 
 int64_t HashTable::CurrentMemSize() const {
@@ -308,10 +290,7 @@ bool HashTable::ResizeBuckets(int64_t num_buckets, HashTableCtx* ht_ctx) {
   // of the old hash table.
   int64_t old_size = num_buckets_ * sizeof(Bucket);
   int64_t new_size = num_buckets * sizeof(Bucket);
-  if (block_mgr_client_ != NULL &&
-      !state_->block_mgr()->ConsumeMemory(block_mgr_client_, new_size)) {
-    return false;
-  }
+  if (!state_->block_mgr()->ConsumeMemory(block_mgr_client_, new_size)) return false;
   Bucket* new_buckets = reinterpret_cast<Bucket*>(malloc(new_size));
   DCHECK(new_buckets != NULL);
   memset(new_buckets, 0, new_size);
@@ -335,37 +314,24 @@ bool HashTable::ResizeBuckets(int64_t num_buckets, HashTableCtx* ht_ctx) {
   num_buckets_ = num_buckets;
   free(buckets_);
   buckets_ = new_buckets;
-  // TODO: Remove this check, i.e. block_mgr_client_ should always be != NULL,
-  // see IMPALA-1656.
-  if (block_mgr_client_ != NULL) {
-    state_->block_mgr()->ReleaseMemory(block_mgr_client_, old_size);
-  }
+  state_->block_mgr()->ReleaseMemory(block_mgr_client_, old_size);
   return true;
 }
 
 bool HashTable::GrowNodeArray() {
   int64_t page_size = 0;
-  if (block_mgr_client_ != NULL) {
-    page_size = state_->block_mgr()->max_block_size();;
-    if (data_pages_.size() < NUM_SMALL_DATA_PAGES) {
-      page_size = min(page_size, INITIAL_DATA_PAGE_SIZES[data_pages_.size()]);
-    }
-    BufferedBlockMgr::Block* block = NULL;
-    Status status = state_->block_mgr()->GetNewBlock(
-        block_mgr_client_, NULL, &block, page_size);
-    DCHECK(status.ok() || block == NULL);
-    if (block == NULL) return false;
-    data_pages_.push_back(block);
-    next_node_ = block->Allocate<DuplicateNode>(page_size);
-    ImpaladMetrics::HASH_TABLE_TOTAL_BYTES->Increment(page_size);
-  } else {
-    // Only used for testing.
-    DCHECK(data_page_pool_ != NULL);
-    page_size = TEST_PAGE_SIZE;
-    next_node_ = reinterpret_cast<DuplicateNode*>(data_page_pool_->Allocate(page_size));
-    if (data_page_pool_->mem_tracker()->LimitExceeded()) return false;
-    DCHECK(next_node_ != NULL);
+  page_size = state_->block_mgr()->max_block_size();
+  if (data_pages_.size() < NUM_SMALL_DATA_PAGES) {
+    page_size = min(page_size, INITIAL_DATA_PAGE_SIZES[data_pages_.size()]);
   }
+  BufferedBlockMgr::Block* block = NULL;
+  Status status = state_->block_mgr()->GetNewBlock(
+      block_mgr_client_, NULL, &block, page_size);
+  DCHECK(status.ok() || block == NULL);
+  if (block == NULL) return false;
+  data_pages_.push_back(block);
+  next_node_ = block->Allocate<DuplicateNode>(page_size);
+  ImpaladMetrics::HASH_TABLE_TOTAL_BYTES->Increment(page_size);
   node_remaining_current_page_ = page_size / sizeof(DuplicateNode);
   total_data_page_size_ += page_size;
   return true;
@@ -871,7 +837,7 @@ Function* HashTableCtx::CodegenEquals(RuntimeState* state) {
     // the case where the hash table does not store nulls, this is always false.
     Value* probe_is_null = codegen->false_value();
     uint8_t* null_byte_loc = &expr_value_null_bits_[i];
-    if (stores_nulls_) {
+    if (stores_nulls_ && finds_nulls_[i]) {
       Value* llvm_null_byte_loc =
           codegen->CastPtrToLlvmPtr(codegen->ptr_type(), null_byte_loc);
       Value* null_byte = builder.CreateLoad(llvm_null_byte_loc);

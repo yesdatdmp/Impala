@@ -928,6 +928,7 @@ public class Analyzer {
       }
     }
     for (Expr conjunct: conjuncts) {
+      conjunct.setIsOnClauseConjunct(true);
       registerConjunct(conjunct);
       if (rhsRef.getJoinOp().isOuterJoin()) {
         globalState_.ojClauseByConjunct.put(conjunct.getId(), rhsRef);
@@ -942,13 +943,12 @@ public class Analyzer {
 
   /**
    * Register all conjuncts that make up 'e'. If fromHavingClause is false, this conjunct
-   * is assumed to originate from a Where clause.
+   * is assumed to originate from a WHERE or ON clause.
    */
   public void registerConjuncts(Expr e, boolean fromHavingClause)
       throws AnalysisException {
     for (Expr conjunct: e.getConjuncts()) {
       registerConjunct(conjunct);
-      if (!fromHavingClause) conjunct.setIsWhereClauseConjunct();
       markConstantConjunct(conjunct, fromHavingClause);
     }
   }
@@ -1009,7 +1009,8 @@ public class Analyzer {
     // form <expr1> = <expr2> where at least one of the exprs is bound by
     // exactly one tuple id
     if (binaryPred.getOp() != BinaryPredicate.Operator.EQ &&
-       binaryPred.getOp() != BinaryPredicate.Operator.NULL_MATCHING_EQ) {
+       binaryPred.getOp() != BinaryPredicate.Operator.NULL_MATCHING_EQ &&
+       binaryPred.getOp() != BinaryPredicate.Operator.NOT_DISTINCT) {
       return;
     }
     // the binary predicate must refer to at least two tuples to be an eqJoinConjunct
@@ -1055,12 +1056,13 @@ public class Analyzer {
   }
 
   /**
-   * Creates an analyzed equality predicate between the given slots.
+   * Creates an inferred equality predicate between the given slots.
    */
-  public BinaryPredicate createEqPredicate(SlotId lhsSlotId, SlotId rhsSlotId) {
+  public BinaryPredicate createInferredEqPred(SlotId lhsSlotId, SlotId rhsSlotId) {
     BinaryPredicate pred = new BinaryPredicate(BinaryPredicate.Operator.EQ,
         new SlotRef(globalState_.descTbl.getSlotDesc(lhsSlotId)),
         new SlotRef(globalState_.descTbl.getSlotDesc(rhsSlotId)));
+    pred.setIsInferred();
     // create casts if needed
     pred.analyzeNoThrow(this);
     return pred;
@@ -1127,7 +1129,7 @@ public class Analyzer {
     e.getIds(tids, null);
     if (tids.isEmpty()) return false;
     if (tids.size() > 1 || isOjConjunct(e) || isFullOuterJoined(e)
-        || (isOuterJoined(tids.get(0)) && e.isWhereClauseConjunct())
+        || (isOuterJoined(tids.get(0)) && !e.isOnClauseConjunct())
         || (isAntiJoinedConjunct(e) && !isSemiJoined(tids.get(0)))) {
       return true;
     }
@@ -1247,11 +1249,11 @@ public class Analyzer {
    * Returns true if predicate 'e' can be correctly evaluated by a tree materializing
    * 'tupleIds', otherwise false:
    * - the predicate needs to be bound by tupleIds
-   * - a Where clause predicate can only be correctly evaluated if for all outer-joined
-   *   referenced tids the last join to outer-join this tid has been materialized
    * - an On clause predicate against the non-nullable side of an Outer Join clause
    *   can only be correctly evaluated by the join node that materializes the
    *   Outer Join clause
+   * - otherwise, a predicate can only be correctly evaluated if for all outer-joined
+   *   referenced tids the last join to outer-join this tid has been materialized
    */
   public boolean canEvalPredicate(List<TupleId> tupleIds, Expr e) {
     LOG.trace("canEval: " + e.toSql() + " " + e.debugString() + " "
@@ -1261,7 +1263,7 @@ public class Analyzer {
     e.getIds(tids, null);
     if (tids.isEmpty()) return true;
 
-    if (!e.isWhereClauseConjunct()) {
+    if (e.isOnClauseConjunct()) {
       if (tids.size() > 1) {
         // If the conjunct is from the ON-clause of an anti join, check if we can
         // assign it to this node.
@@ -1386,19 +1388,16 @@ public class Analyzer {
         }
       }
 
-      // It is incorrect to propagate a Where-clause predicate into a plan subtree that
-      // is on the nullable side of an outer join if the predicate evaluates to true
-      // when all its referenced tuples are NULL. The check below is conservative
-      // because the outer-joined tuple making 'hasOuterJoinedTuple' true could be in a
-      // parent block of 'srcConjunct', in which case it is safe to propagate
-      // 'srcConjunct' within child blocks of the outer-joined parent block.
+      // It is incorrect to propagate predicates into a plan subtree that is on the
+      // nullable side of an outer join if the predicate evaluates to true when all
+      // its referenced tuples are NULL. The check below is conservative because the
+      // outer-joined tuple making 'hasOuterJoinedTuple' true could be in a parent block
+      // of 'srcConjunct', in which case it is safe to propagate 'srcConjunct' within
+      // child blocks of the outer-joined parent block.
       // TODO: Make the check precise by considering the blocks (analyzers) where the
       // outer-joined tuples in the dest slot's equivalence classes appear
       // relative to 'srcConjunct'.
-      if (srcConjunct.isWhereClauseConjunct_ && hasOuterJoinedTuple &&
-          isTrueWithNullSlots(srcConjunct)) {
-        continue;
-      }
+      if (hasOuterJoinedTuple && isTrueWithNullSlots(srcConjunct)) continue;
 
       // if srcConjunct comes out of an OJ's On clause, we need to make sure it's the
       // same as the one that makes destTid nullable
@@ -1433,13 +1432,14 @@ public class Analyzer {
           }
           try {
             p = srcConjunct.trySubstitute(smap, this, false);
-            // Unset the id because this bound predicate itself is not registered, and
-            // to prevent callers from inadvertently marking the srcConjunct as assigned.
-            p.setId(null);
           } catch (ImpalaException exc) {
             // not an executable predicate; ignore
             continue;
           }
+          // Unset the id because this bound predicate itself is not registered, and
+          // to prevent callers from inadvertently marking the srcConjunct as assigned.
+          p.setId(null);
+          if (p instanceof BinaryPredicate) ((BinaryPredicate) p).setIsInferred();
           LOG.trace("new pred: " + p.toSql() + " " + p.debugString());
         }
 
@@ -1615,8 +1615,7 @@ public class Analyzer {
       if (isFullOuterJoined(lhsSlots.get(0)) || isFullOuterJoined(rhsSlots.get(0))) {
         continue;
       }
-      T newEqPred = (T) createEqPredicate(lhsSlots.get(0), rhsSlots.get(0));
-      newEqPred.analyzeNoThrow(this);
+      T newEqPred = (T) createInferredEqPred(lhsSlots.get(0), rhsSlots.get(0));
       if (!hasMutualValueTransfer(lhsSlots.get(0), rhsSlots.get(0))) continue;
       conjuncts.add(newEqPred);
     }
@@ -1689,7 +1688,7 @@ public class Analyzer {
           SlotId lhs = slotIds.get(j);
           if (!partialEquivSlots.union(lhs, rhs)) continue;
           if (!hasMutualValueTransfer(lhs, rhs)) continue;
-          conjuncts.add((T) createEqPredicate(lhs, rhs));
+          conjuncts.add((T) createInferredEqPred(lhs, rhs));
           // Check for early termination.
           if (partialEquivSlots.get(lhs).size() == slotIds.size()) {
             done = true;
@@ -1798,20 +1797,20 @@ public class Analyzer {
    * false otherwise.
    * TODO: Can we avoid dealing with the exceptions thrown by analysis and eval?
    */
-  private boolean isTrueWithNullSlots(Expr p) {
+  public boolean isTrueWithNullSlots(Expr p) {
     // Construct predicate with all SlotRefs substituted by NullLiterals.
     List<SlotRef> slotRefs = Lists.newArrayList();
     p.collect(Predicates.instanceOf(SlotRef.class), slotRefs);
 
-    Expr nullTuplePred = null;
     // Map for substituting SlotRefs with NullLiterals.
     ExprSubstitutionMap nullSmap = new ExprSubstitutionMap();
-    NullLiteral nullLiteral = new NullLiteral();
-    nullLiteral.analyzeNoThrow(this);
     for (SlotRef slotRef: slotRefs) {
-      nullSmap.put(slotRef.clone(), nullLiteral.clone());
+        // Preserve the original SlotRef type to ensure all substituted
+        // subexpressions in the predicate have the same return type and
+        // function signature as in the original predicate.
+        nullSmap.put(slotRef.clone(), NullLiteral.create(slotRef.getType()));
     }
-    nullTuplePred = p.substitute(nullSmap, this, false);
+    Expr nullTuplePred = p.substitute(nullSmap, this, false);
     try {
       return FeSupport.EvalPredicate(nullTuplePred, getQueryCtx());
     } catch (InternalException e) {

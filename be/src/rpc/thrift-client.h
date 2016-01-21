@@ -67,6 +67,7 @@ class ThriftClientImpl {
  protected:
   ThriftClientImpl(const std::string& ipaddress, int port, bool ssl)
       : address_(MakeNetworkAddress(ipaddress, port)), ssl_(ssl) {
+    if (ssl_) ssl_factory_.reset(new TSSLSocketFactory());
     socket_create_status_ = CreateSocket();
   }
 
@@ -86,6 +87,11 @@ class ThriftClientImpl {
   /// Will be NULL if kerberos is not being used.
   boost::shared_ptr<sasl::TSasl> sasl_client_;
 
+  /// This factory sets up the openSSL library state and needs to be alive as long as its
+  /// owner(a ThriftClientImpl instance) does. Otherwise the OpenSSL state is lost
+  /// (refer IMPALA-2747).
+  boost::scoped_ptr<apache::thrift::transport::TSSLSocketFactory> ssl_factory_;
+
   /// All shared pointers, because Thrift requires them to be
   boost::shared_ptr<apache::thrift::transport::TSocket> socket_;
   boost::shared_ptr<apache::thrift::transport::TTransport> transport_;
@@ -93,8 +99,8 @@ class ThriftClientImpl {
 };
 
 
-/// Utility client to a Thrift server. The parameter type is the Thrift interface type that
-/// the server implements.
+/// Utility client to a Thrift server. The parameter type is the Thrift interface type
+/// that the server implements.
 /// TODO: Consider a builder class to make constructing this class easier.
 template <class InterfaceType>
 class ThriftClient : public ThriftClientImpl {
@@ -131,7 +137,8 @@ ThriftClient<InterfaceType>::ThriftClient(const std::string& ipaddress, int port
   // Here transport_->isOpen() will call socker_->isOpen(), when socket_ is NULL,
   // it will crash
   if (socket_ != NULL) {
-    transport_.reset(new apache::thrift::transport::TBufferedTransport(socket_));
+    ThriftServer::BufferedTransportFactory factory;
+    transport_ = factory.getTransport(socket_);
   }
 
   if (auth_provider_ == NULL) {

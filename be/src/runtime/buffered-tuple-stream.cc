@@ -17,7 +17,7 @@
 #include <boost/bind.hpp>
 #include <gutil/strings/substitute.h>
 
-#include "runtime/array-value.h"
+#include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
 #include "runtime/row-batch.h"
 #include "runtime/tuple-row.h"
@@ -45,9 +45,9 @@ string BufferedTupleStream::RowIdx::DebugString() const {
 BufferedTupleStream::BufferedTupleStream(RuntimeState* state,
     const RowDescriptor& row_desc, BufferedBlockMgr* block_mgr,
     BufferedBlockMgr::Client* client, bool use_initial_small_buffers,
-    bool delete_on_read, bool read_write)
+    bool read_write)
   : use_small_buffers_(use_initial_small_buffers),
-    delete_on_read_(delete_on_read),
+    delete_on_read_(false),
     read_write_(read_write),
     state_(state),
     desc_(row_desc),
@@ -134,7 +134,6 @@ Status BufferedTupleStream::Init(int node_id, RuntimeProfile* profile, bool pinn
   RETURN_IF_ERROR(NewBlockForWrite(fixed_tuple_row_size_, &got_block));
   if (!got_block) return block_mgr_->MemLimitTooLowError(block_mgr_client_, node_id);
   DCHECK(write_block_ != NULL);
-  if (read_write_) RETURN_IF_ERROR(PrepareForRead());
   if (!pinned) RETURN_IF_ERROR(UnpinStream());
   return Status::OK();
 }
@@ -276,7 +275,7 @@ Status BufferedTupleStream::NextBlockForRead() {
     read_block_ = blocks_.begin();
     read_block_idx_ = 0;
     if (block_to_free != NULL && !block_to_free->is_max_size()) {
-      RETURN_IF_ERROR(block_to_free->Delete());
+      block_to_free->Delete();
       block_to_free = NULL;
       DCHECK_EQ(num_pinned_, NumPinned(blocks_)) << DebugString();
     }
@@ -296,7 +295,7 @@ Status BufferedTupleStream::NextBlockForRead() {
     if (block_to_free != NULL) {
       SCOPED_TIMER(unpin_timer_);
       if (delete_on_read_) {
-        RETURN_IF_ERROR(block_to_free->Delete());
+        block_to_free->Delete();
         --num_pinned_;
       } else {
         RETURN_IF_ERROR(UnpinBlock(block_to_free));
@@ -323,7 +322,7 @@ Status BufferedTupleStream::NextBlockForRead() {
   return Status::OK();
 }
 
-Status BufferedTupleStream::PrepareForRead(bool* got_buffer) {
+Status BufferedTupleStream::PrepareForRead(bool delete_on_read, bool* got_buffer) {
   DCHECK(!closed_);
   if (blocks_.empty()) return Status::OK();
 
@@ -362,6 +361,7 @@ Status BufferedTupleStream::PrepareForRead(bool* got_buffer) {
   read_bytes_ = 0;
   rows_returned_ = 0;
   read_block_idx_ = 0;
+  delete_on_read_ = delete_on_read;
   if (got_buffer != NULL) *got_buffer = true;
   return Status::OK();
 }
@@ -445,7 +445,7 @@ int BufferedTupleStream::ComputeNumNullIndicatorBytes(int block_size) const {
 Status BufferedTupleStream::GetRows(scoped_ptr<RowBatch>* batch, bool* got_rows) {
   RETURN_IF_ERROR(PinStream(false, got_rows));
   if (!*got_rows) return Status::OK();
-  RETURN_IF_ERROR(PrepareForRead());
+  RETURN_IF_ERROR(PrepareForRead(false));
   batch->reset(
       new RowBatch(desc_, num_rows(), block_mgr_->get_tracker(block_mgr_client_)));
   bool eos = false;
@@ -577,9 +577,9 @@ Status BufferedTupleStream::GetNextInternal(RowBatch* batch, bool* eos,
       ReadStrings(string_slots_[j].second, data_len, tuple);
     }
 
-    // Update collection slot ptrs. We traverse the array structure in the same order as
-    // it was written to the stream, allowing us to infer the data layout based on the
-    // length of arrays and strings.
+    // Update collection slot ptrs. We traverse the collection structure in the same order
+    // as it was written to the stream, allowing us to infer the data layout based on the
+    // length of collections and strings.
     for (int j = 0; j < collection_slots_.size(); ++j) {
       Tuple* tuple = row->GetTuple(collection_slots_[j].first);
       if (HasNullableTuple && tuple == NULL) continue;
@@ -624,21 +624,21 @@ void BufferedTupleStream::ReadCollections(const vector<SlotDescriptor*>& collect
     const SlotDescriptor* slot_desc = collection_slots[i];
     if (tuple->IsNull(slot_desc->null_indicator_offset())) continue;
 
-    ArrayValue* av = tuple->GetCollectionSlot(slot_desc->tuple_offset());
+    CollectionValue* cv = tuple->GetCollectionSlot(slot_desc->tuple_offset());
     const TupleDescriptor& item_desc = *slot_desc->collection_item_descriptor();
-    int array_byte_size = av->num_tuples * item_desc.byte_size();
-    DCHECK_LE(array_byte_size, data_len - read_bytes_);
-    av->ptr = reinterpret_cast<uint8_t*>(read_ptr_);
-    read_ptr_ += array_byte_size;
-    read_bytes_ += array_byte_size;
+    int coll_byte_size = cv->num_tuples * item_desc.byte_size();
+    DCHECK_LE(coll_byte_size, data_len - read_bytes_);
+    cv->ptr = reinterpret_cast<uint8_t*>(read_ptr_);
+    read_ptr_ += coll_byte_size;
+    read_bytes_ += coll_byte_size;
 
     if (!item_desc.HasVarlenSlots()) continue;
-    uint8_t* array_data = av->ptr;
-    for (int j = 0; j < av->num_tuples; ++j) {
-      Tuple* item = reinterpret_cast<Tuple*>(array_data);
+    uint8_t* coll_data = cv->ptr;
+    for (int j = 0; j < cv->num_tuples; ++j) {
+      Tuple* item = reinterpret_cast<Tuple*>(coll_data);
       ReadStrings(item_desc.string_slots(), data_len, item);
       ReadCollections(item_desc.collection_slots(), data_len, item);
-      array_data += item_desc.byte_size();
+      coll_data += item_desc.byte_size();
     }
   }
 }

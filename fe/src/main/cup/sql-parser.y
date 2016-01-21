@@ -26,6 +26,7 @@ import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.analysis.ColumnDef;
 import com.cloudera.impala.analysis.UnionStmt.UnionOperand;
 import com.cloudera.impala.analysis.UnionStmt.Qualifier;
+import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TFunctionCategory;
 import com.cloudera.impala.thrift.TDescribeOutputStyle;
 import com.cloudera.impala.thrift.THdfsFileFormat;
@@ -297,6 +298,7 @@ nonterminal ShowFilesStmt show_files_stmt;
 nonterminal DescribeDbStmt describe_db_stmt;
 nonterminal DescribeTableStmt describe_table_stmt;
 nonterminal ShowCreateTableStmt show_create_tbl_stmt;
+nonterminal TCatalogObjectType show_create_tbl_object_type;
 nonterminal ShowCreateFunctionStmt show_create_function_stmt;
 nonterminal TDescribeOutputStyle describe_output_style;
 nonterminal LoadDataStmt load_stmt;
@@ -458,7 +460,7 @@ precedence left KW_AND;
 precedence right KW_NOT, NOT;
 precedence left KW_BETWEEN, KW_IN, KW_IS, KW_EXISTS;
 precedence left KW_LIKE, KW_RLIKE, KW_REGEXP;
-precedence left EQUAL, NOTEQUAL, LESSTHAN, GREATERTHAN;
+precedence left EQUAL, NOTEQUAL, LESSTHAN, GREATERTHAN, KW_FROM, KW_DISTINCT;
 precedence left ADD, SUBTRACT;
 precedence left STAR, DIVIDE, MOD, KW_DIV;
 precedence left BITAND, BITOR, BITXOR, BITNOT;
@@ -877,7 +879,27 @@ create_tbl_as_select_stmt ::=
     CreateTableStmt create_stmt = new CreateTableStmt(table, new ArrayList<ColumnDef>(),
         new ArrayList<ColumnDef>(), external, comment, row_format,
         file_format, location, cache_op, if_not_exists, tbl_props, serde_props);
-    RESULT = new CreateTableAsSelectStmt(create_stmt, query);
+    RESULT = new CreateTableAsSelectStmt(create_stmt, query, null);
+  :}
+  // Create partitioned tables with CTAS statement. We need an own production
+  // here, combining both into one causes an unresolvable reduce/reduce
+  // conflicts due to the optional clauses.
+  // follow the PARTITION feature of insert from select statements.
+  | KW_CREATE external_val:external KW_TABLE if_not_exists_val:if_not_exists
+  table_name:table
+  KW_PARTITIONED KW_BY LPAREN ident_list:partition_cols RPAREN
+  comment_val:comment row_format_val:row_format
+  serde_properties:serde_props file_format_create_table_val:file_format
+  location_val:location cache_op_val:cache_op tbl_properties:tbl_props
+  KW_AS query_stmt:query
+  {:
+    // Initialize with empty List of columns and partition columns. The
+    // columns will be added by the query statement during analysis.
+    CreateTableStmt create_stmt = new CreateTableStmt(table,
+        new ArrayList<ColumnDef>(), new ArrayList<ColumnDef>(), external,
+        comment, row_format, file_format, location, cache_op, if_not_exists,
+        tbl_props, serde_props);
+    RESULT = new CreateTableAsSelectStmt(create_stmt, query, partition_cols);
   :}
   ;
 
@@ -1706,8 +1728,15 @@ show_pattern ::=
   ;
 
 show_create_tbl_stmt ::=
-  KW_SHOW KW_CREATE KW_TABLE table_name:table
-  {: RESULT = new ShowCreateTableStmt(table); :}
+  KW_SHOW KW_CREATE show_create_tbl_object_type:object_type table_name:table
+  {: RESULT = new ShowCreateTableStmt(table, object_type); :}
+  ;
+
+show_create_tbl_object_type ::=
+  KW_TABLE
+  {: RESULT = TCatalogObjectType.TABLE; :}
+  | KW_VIEW
+  {: RESULT = TCatalogObjectType.VIEW; :}
   ;
 
 show_create_function_stmt ::=
@@ -2406,6 +2435,12 @@ comparison_predicate ::=
   {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.LT, e1, e2); :}
   | expr:e1 GREATERTHAN expr:e2
   {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.GT, e1, e2); :}
+  | expr:e1 LESSTHAN EQUAL GREATERTHAN expr:e2
+  {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.NOT_DISTINCT, e1, e2); :}
+  | expr:e1 KW_IS KW_DISTINCT KW_FROM expr:e2
+  {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.DISTINCT_FROM, e1, e2); :}
+  | expr:e1 KW_IS KW_NOT KW_DISTINCT KW_FROM expr:e2
+  {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.NOT_DISTINCT, e1, e2); :}
   ;
 
 like_predicate ::=

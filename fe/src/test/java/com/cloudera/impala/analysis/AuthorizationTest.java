@@ -42,6 +42,7 @@ import com.cloudera.impala.authorization.AuthorizeableTable;
 import com.cloudera.impala.authorization.User;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Catalog;
+import com.cloudera.impala.catalog.Db;
 import com.cloudera.impala.catalog.ImpaladCatalog;
 import com.cloudera.impala.catalog.ScalarFunction;
 import com.cloudera.impala.catalog.Type;
@@ -51,6 +52,7 @@ import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.service.Frontend;
 import com.cloudera.impala.testutil.ImpaladTestCatalog;
 import com.cloudera.impala.testutil.TestUtils;
+import com.cloudera.impala.thrift.TFunctionBinaryType;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpcode;
 import com.cloudera.impala.thrift.TNetworkAddress;
@@ -66,6 +68,7 @@ import com.google.common.collect.Lists;
 
 @RunWith(Parameterized.class)
 public class AuthorizationTest {
+
   private final static Logger LOG =
       LoggerFactory.getLogger(AuthorizationTest.class);
 
@@ -89,6 +92,13 @@ public class AuthorizationTest {
   //   No permissions on database 'functional_rc'
   private final static String AUTHZ_POLICY_FILE = "/test-warehouse/authz-policy.ini";
   private final static User USER = new User(System.getProperty("user.name"));
+
+  // Tables in functional that the current user and 'test_user' have table- or
+  // column-level SELECT or INSERT permission. I.e. that should be returned by
+  // 'SHOW TABLES'.
+  private static final List<String> FUNCTIONAL_VISIBLE_TABLES = Lists.newArrayList(
+      "allcomplextypes", "alltypes", "alltypesagg", "alltypessmall", "alltypestiny",
+      "complex_view", "view_view");
 
   // The admin_user has ALL privileges on the server.
   private final static User ADMIN_USER = new User("admin_user");
@@ -177,6 +187,13 @@ public class AuthorizationTest {
         false);
     privilege.setServer_name("server1");
     privilege.setUri("hdfs://localhost:20500/test-warehouse/new_table");
+    privilege.setTable_name(AuthorizeableTable.ANY_TABLE_NAME);
+    sentryService.grantRolePrivilege(USER, roleName, privilege);
+
+    privilege = new TPrivilege("", TPrivilegeLevel.ALL, TPrivilegeScope.URI,
+        false);
+    privilege.setServer_name("server1");
+    privilege.setUri("hdfs://localhost:20500/test-warehouse/UPPER_CASE");
     privilege.setTable_name(AuthorizeableTable.ANY_TABLE_NAME);
     sentryService.grantRolePrivilege(USER, roleName, privilege);
 
@@ -822,6 +839,16 @@ public class AuthorizationTest {
     // source table
     AuthzError("create table tpch_rc.new_tbl as select * from functional.alltypestiny",
         "User '%s' does not have privileges to execute 'CREATE' on: tpch_rc.new_tbl");
+
+    // Try creating an external table on a URI with upper case letters
+    AuthzOk("create external table tpch.upper_case (a int) location " +
+        "'hdfs://localhost:20500/test-warehouse/UPPER_CASE/test'");
+
+    // Try creating table on the same URI in lower case. It should fail
+    AuthzError("create external table tpch.upper_case (a int) location " +
+        "'hdfs://localhost:20500/test-warehouse/upper_case/test'",
+        "User '%s' does not have privileges to access: " +
+        "hdfs://localhost:20500/test-warehouse/upper_case/test");
   }
 
   @Test
@@ -1441,31 +1468,34 @@ public class AuthorizationTest {
     List<String> expectedDbs = Lists.newArrayList("default", "functional",
         "functional_parquet", "functional_seq_snap", "tpcds", "tpch");
 
-    List<String> dbs = fe_.getDbNames("*", USER);
-    Assert.assertEquals(expectedDbs, dbs);
+    List<Db> dbs = fe_.getDbs("*", USER);
+    assertEquals(expectedDbs, extractDbNames(dbs));
 
-    dbs = fe_.getDbNames(null, USER);
-    Assert.assertEquals(expectedDbs, dbs);
+    dbs = fe_.getDbs(null, USER);
+    assertEquals(expectedDbs, extractDbNames(dbs));
+  }
+
+  private List<String> extractDbNames(List<Db> dbs) {
+    List<String> names = Lists.newArrayListWithCapacity(dbs.size());
+    for (Db db: dbs) names.add(db.getName());
+    return names;
   }
 
   @Test
   public void TestShowTableResultsFiltered() throws ImpalaException {
-    // The user only has permission on these tables/views in the functional databases.
-    List<String> expectedTbls = Lists.newArrayList("allcomplextypes", "alltypes",
-        "alltypesagg", "alltypessmall", "alltypestiny", "complex_view",
-        "view_view");
-
     List<String> tables = fe_.getTableNames("functional", "*", USER);
-    Assert.assertEquals(expectedTbls, tables);
+    Assert.assertEquals(FUNCTIONAL_VISIBLE_TABLES, tables);
 
     tables = fe_.getTableNames("functional", null, USER);
-    Assert.assertEquals(expectedTbls, tables);
+    Assert.assertEquals(FUNCTIONAL_VISIBLE_TABLES, tables);
   }
 
   @Test
   public void TestShowCreateTable() throws ImpalaException {
     AuthzOk("show create table functional.alltypesagg");
     AuthzOk("show create table functional.alltypes");
+    // Have permissions on view and underlying table.
+    AuthzOk("show create table functional_seq_snap.alltypes_view");
 
     // Unqualified table name.
     AuthzError("show create table alltypes",
@@ -1482,6 +1512,11 @@ public class AuthorizationTest {
     // User has column-level privileges on table
     AuthzError("show create table functional.alltypestiny",
         "User '%s' does not have privileges to access: functional.alltypestiny");
+
+    // Cannot show SQL if user doesn't have permissions on underlying table.
+    AuthzError("show create table functional.complex_view",
+        "User '%s' does not have privileges to see the definition of view " +
+        "'functional.complex_view'.");
   }
 
   @Test
@@ -1494,19 +1529,11 @@ public class AuthorizationTest {
     // Get all tables
     req.get_tables_req.setTableName("%");
     TResultSet resp = fe_.execHiveServer2MetadataOp(req);
-    assertEquals(7, resp.rows.size());
-    assertEquals("allcomplextypes",
-        resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypes", resp.rows.get(1).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypesagg",
-        resp.rows.get(2).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypessmall",
-        resp.rows.get(3).colVals.get(2).string_val.toLowerCase());
-    assertEquals("alltypestiny",
-        resp.rows.get(4).colVals.get(2).string_val.toLowerCase());
-    assertEquals("complex_view",
-        resp.rows.get(5).colVals.get(2).string_val.toLowerCase());
-    assertEquals("view_view", resp.rows.get(6).colVals.get(2).string_val.toLowerCase());
+    assertEquals(FUNCTIONAL_VISIBLE_TABLES.size(), resp.rows.size());
+    for (int i = 0; i < resp.rows.size(); ++i) {
+      assertEquals(FUNCTIONAL_VISIBLE_TABLES.get(i),
+          resp.rows.get(i).colVals.get(2).string_val.toLowerCase());
+    }
 
     // Get all tables of tpcds
     req.get_tables_req.setSchemaName("tpcds");
@@ -1662,10 +1689,12 @@ public class AuthorizationTest {
           "Cannot modify system database.");
 
       // Add default.f(), tpch.f()
-      catalog_.addFunction(new ScalarFunction(new FunctionName("default", "f"),
-          new ArrayList<Type>(), Type.INT, null, null, null, null));
-      catalog_.addFunction(new ScalarFunction(new FunctionName("tpch", "f"),
-          new ArrayList<Type>(), Type.INT, null, null, null, null));
+      catalog_.addFunction(ScalarFunction.createForTesting("default", "f",
+          new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null,
+          null, TFunctionBinaryType.NATIVE));
+      catalog_.addFunction(ScalarFunction.createForTesting("tpch", "f",
+          new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null,
+          null, TFunctionBinaryType.NATIVE));
 
       AuthzOk("drop function tpch.f()");
     } finally {
@@ -1681,10 +1710,12 @@ public class AuthorizationTest {
 
       //Other tests don't expect tpch to contain functions
       //Specifically, if these functions are not cleaned up, TestDropDatabase() will fail
-      catalog_.removeFunction(new ScalarFunction(new FunctionName("default", "f"),
-          new ArrayList<Type>(), Type.INT, null, null, null, null));
-      catalog_.removeFunction(new ScalarFunction(new FunctionName("tpch", "f"),
-          new ArrayList<Type>(), Type.INT, null, null, null, null));
+      catalog_.removeFunction(ScalarFunction.createForTesting("default", "f",
+          new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null,
+          null, TFunctionBinaryType.NATIVE));
+      catalog_.removeFunction(ScalarFunction.createForTesting("tpch", "f",
+          new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null,
+          null, TFunctionBinaryType.NATIVE));
     }
   }
 

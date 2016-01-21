@@ -16,7 +16,7 @@ from subprocess import call
 from tests.common.test_vector import *
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import *
-from tests.common.skip import SkipIfS3, SkipIfIsilon
+from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
 from tests.util.filesystem_utils import WAREHOUSE
 
 # The purpose of view compatibility testing is to check whether views created in Hive
@@ -40,6 +40,7 @@ from tests.util.filesystem_utils import WAREHOUSE
 # other on non hdfs storage.
 @SkipIfS3.hive
 @SkipIfIsilon.hive
+@SkipIfLocal.hive
 class TestViewCompatibility(ImpalaTestSuite):
   TEST_DB_NAME = "view_compat_test_db"
   VALID_SECTION_NAMES = ["CREATE_VIEW", "CREATE_VIEW_RESULTS",\
@@ -52,6 +53,10 @@ class TestViewCompatibility(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestViewCompatibility, cls).add_test_dimensions()
+
+    if cls.exploration_strategy() != 'exhaustive':
+      pytest.skip("Should only run in exhaustive due to long execution time.")
+
     # don't use any exec options, running exactly once is fine
     cls.TestMatrix.clear_dimension('exec_option')
     # There is no reason to run these tests using all dimensions.

@@ -31,7 +31,6 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import com.cloudera.impala.catalog.ArrayType;
-import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.CatalogException;
 import com.cloudera.impala.analysis.CreateTableStmt;
 import com.cloudera.impala.catalog.DataSource;
@@ -1156,6 +1155,24 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "'b.int_array_col' correlated with an outer block as well as an " +
         "uncorrelated one 'functional.alltypes':\n" +
         "SELECT item FROM b.int_array_col, functional.alltypes");
+
+    // CTAS into partitioned table.
+    AnalyzesOk("create table p partitioned by (int_col) as " +
+        "select double_col, int_col from functional.alltypes");
+    AnalyzesOk("create table p partitioned by (int_col) as " +
+        "select sum(double_col), int_col from functional.alltypes group by int_col");
+    // At least one non-partition column must be specified.
+    AnalysisError("create table p partitioned by (int_col, tinyint_col) as " +
+        "select int_col, tinyint_col from functional.alltypes",
+        "Number of partition columns (2) must be smaller than the number of columns in " +
+        "the select statement (2).");
+    // Order of the columns is important and not automatically corrected.
+    AnalysisError("create table p partitioned by (int_col) as " +
+        "select double_col, int_col, tinyint_col from functional.alltypes",
+        "Partition column name mismatch: int_col != tinyint_col");
+    AnalysisError("create table p partitioned by (tinyint_col, int_col) as " +
+        "select double_col, int_col, tinyint_col from functional.alltypes",
+        "Partition column name mismatch: tinyint_col != int_col");
   }
 
   @Test
@@ -2336,7 +2353,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
   @Test
   public void TestDescribeDb() throws AnalysisException {
-    addTestDb("test_analyse_desc_db");
+    addTestDb("test_analyse_desc_db", null);
     AnalyzesOk("describe database test_analyse_desc_db");
     AnalyzesOk("describe database extended test_analyse_desc_db");
     AnalyzesOk("describe database formatted test_analyse_desc_db");
@@ -2374,7 +2391,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "Could not resolve path: 'functional_parquet.allcomplextypes.nonexistent'");
 
     // Handling of ambiguous paths.
-    addTestDb("ambig");
+    addTestDb("ambig", null);
     addTestTable("create table ambig.ambig (ambig struct<ambig:array<int>>)");
     // Single element path can only be resolved as <table>.
     DescribeTableStmt describe = (DescribeTableStmt)AnalyzesOk("describe ambig",

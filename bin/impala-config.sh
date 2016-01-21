@@ -16,16 +16,10 @@
 # setup your environment. If $IMPALA_HOME is undefined
 # this script will set it to the current working directory.
 
-# Setting up Impala binary toolchain. The default path is /opt/bin-toolchain but can be
-# set to any path that contains the necessary dependencies in the format of
-#   /opt/bin-toolchain/package-X.Y.Z
-: ${IMPALA_TOOLCHAIN=}
-: ${USE_SYSTEM_GCC=0}
-
-# Export both variables
-export USE_SYSTEM_GCC
-export IMPALA_TOOLCHAIN
-
+# This file must be kept compatible with bash options "set -euo pipefail". Those options
+# will be set by other scripts before sourcing this file. Those options are not set in
+# this script because scripts outside this repository may need to be updated and that
+# is not practical at this time.
 export JAVA_HOME="${JAVA_HOME:-/usr/java/default}"
 if [ ! -d "$JAVA_HOME" ] ; then
   echo "JAVA_HOME must be set to the location of your JDK!"
@@ -45,10 +39,20 @@ if [ -z $IMPALA_HOME ]; then
   fi
 fi
 
+# Setting up Impala binary toolchain.
+: ${DISABLE_IMPALA_TOOLCHAIN=0}
+: ${IMPALA_TOOLCHAIN=$IMPALA_HOME/toolchain}
+: ${USE_SYSTEM_GCC=0}
+
+export USE_SYSTEM_GCC
+export IMPALA_TOOLCHAIN
+export DISABLE_IMPALA_TOOLCHAIN
+export IS_OSX=$(if [[ "$OSTYPE" == "darwin"* ]]; then echo true; else echo false; fi)
+
 export CDH_MAJOR_VERSION=5
-export HADOOP_LZO=${HADOOP_LZO-~/hadoop-lzo}
-export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
-export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/Impala-auxiliary-tests}
+export HADOOP_LZO=${HADOOP_LZO-$IMPALA_HOME/../hadoop-lzo}
+export IMPALA_LZO=${IMPALA_LZO-$IMPALA_HOME/../Impala-lzo}
+export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-$IMPALA_HOME/../Impala-auxiliary-tests}
 export TARGET_FILESYSTEM=${TARGET_FILESYSTEM-"hdfs"}
 export FILESYSTEM_PREFIX=${FILESYSTEM_PREFIX-""}
 export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY-"DummySecretAccessKey"}
@@ -57,6 +61,8 @@ export S3_BUCKET=${S3_BUCKET-""}
 export HDFS_REPLICATION=${HDFS_REPLICATION-3}
 export ISILON_NAMENODE=${ISILON_NAMENODE-""}
 export DEFAULT_FS=${DEFAULT_FS-"hdfs://localhost:20500"}
+export WAREHOUSE_LOCATION_PREFIX=${WAREHOUSE_LOCATION_PREFIX-""}
+export LOCAL_FS="file:${WAREHOUSE_LOCATION_PREFIX}"
 
 if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
   # Basic error checking
@@ -91,9 +97,21 @@ elif [ "${TARGET_FILESYSTEM}" = "isilon" ]; then
   export DEFAULT_FS
   # isilon manages its own replication.
   export HDFS_REPLICATION=1
+elif [ "${TARGET_FILESYSTEM}" = "local" ]; then
+  if [ ! -d "${WAREHOUSE_LOCATION_PREFIX}" ]; then
+    echo "'$WAREHOUSE_LOCATION_PREFIX' is not a directory on the local filesystem."
+    return 1
+  elif [ ! -r "${WAREHOUSE_LOCATION_PREFIX}" ] || \
+      [ ! -w "${WAREHOUSE_LOCATION_PREFIX}" ]; then
+    echo "Current user does not have read/write permissions on local filesystem path "
+        "'$WAREHOUSE_LOCATION_PREFIX'"
+    return 1
+  fi
+  export DEFAULT_FS=${LOCAL_FS}
+  export FILESYSTEM_PREFIX=${LOCAL_FS}
 elif [ "${TARGET_FILESYSTEM}" != "hdfs" ]; then
   echo "Unsupported filesystem '$TARGET_FILESYSTEM'"
-  echo "Valid values are: hdfs, isilon, s3"
+  echo "Valid values are: hdfs, isilon, s3, local"
   return 1
 fi
 
@@ -133,10 +151,9 @@ export IMPALA_THRIFT_VERSION=0.9.0
 export IMPALA_THRIFT_JAVA_VERSION=0.9.0
 export IMPALA_ZLIB_VERSION=1.2.8
 
-
 # Some of the variables need to be overwritten to explicitely mark the patch level
 if [[ -n "$IMPALA_TOOLCHAIN" ]]; then
-  IMPALA_AVRO_VERSION+=-p3
+  IMPALA_AVRO_VERSION+=-p4
   IMPALA_BZIP2_VERSION+=-p1
   IMPALA_GLOG_VERSION+=-p1
   IMPALA_GPERFTOOLS_VERSION+=-p1
@@ -144,6 +161,16 @@ if [[ -n "$IMPALA_TOOLCHAIN" ]]; then
   IMPALA_RE2_VERSION+=-p1
   IMPALA_LLVM_VERSION+=-p1
 fi
+
+if [[ $OSTYPE == "darwin"* ]]; then
+  IMPALA_CYRUS_SASL_VERSION=2.1.26
+  IMPALA_GPERFTOOLS_VERSION=2.3
+  IMPALA_LLVM_VERSION=3.3-p1
+  IMPALA_OPENSSL_VERSION=1.0.1p
+  IMPALA_THRIFT_VERSION=0.9.2
+  IMPALA_THRIFT_JAVA_VERSION=0.9.2
+fi
+
 
 if [[ ! -z "${IMPALA_CYRUS_SASL_INSTALL_DIR:-}" ]]
 then
@@ -179,7 +206,12 @@ export PATH=$IMPALA_HOME/bin:$PATH
 export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/
 export HADOOP_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 
+: ${HADOOP_CLASSPATH=}
 export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:"${HADOOP_HOME}/share/hadoop/tools/lib/*"
+# YARN is configured to use LZO so the LZO jar needs to be in the hadoop classpath.
+export LZO_JAR_PATH="$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar"
+HADOOP_CLASSPATH+=":$LZO_JAR_PATH"
+
 export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
 export PATH=$HADOOP_HOME/bin:$PATH
 
@@ -201,7 +233,7 @@ if [[ -z "$JDBC_DRIVER" ]]; then
   return
 fi
 export HIVE_AUX_JARS_PATH="$JDBC_DRIVER"
-export AUX_CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar
+export AUX_CLASSPATH="${LZO_JAR_PATH}"
 ### Tell hive not to use jline
 export HADOOP_USER_CLASSPATH_FIRST=true
 
@@ -219,10 +251,15 @@ export HBASE_CONF_DIR=$HIVE_CONF_DIR
 
 # Optionally set the Thrift home to the toolchain
 if [[ -z $IMPALA_TOOLCHAIN ]]; then
-  THRIFT_SRC_DIR=${IMPALA_HOME}/thirdparty/thrift-${IMPALA_THRIFT_VERSION}/
-  export THRIFT_HOME=${THRIFT_SRC_DIR}build/
+  THRIFT_SRC_DIR=${IMPALA_HOME}/thirdparty/thrift-${IMPALA_THRIFT_VERSION}
+  export THRIFT_HOME=${THRIFT_SRC_DIR}/build
 else
-  export THRIFT_HOME=${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_VERSION}/
+  export THRIFT_HOME=${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_VERSION}
+fi
+
+# ASAN needs a matching version of llvm-symbolizer to symbolize stack traces.
+if [[ -n $IMPALA_TOOLCHAIN ]]; then
+  export ASAN_SYMBOLIZER_PATH=${IMPALA_TOOLCHAIN}/llvm-${IMPALA_LLVM_ASAN_VERSION}/bin/llvm-symbolizer
 fi
 
 export CLUSTER_DIR=${IMPALA_HOME}/testdata/cluster
@@ -279,7 +316,7 @@ CLASSPATH="${CLASSPATH-}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
-CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar:$CLASSPATH
+CLASSPATH=$LZO_JAR_PATH:$CLASSPATH
 export CLASSPATH
 
 # Setup aliases

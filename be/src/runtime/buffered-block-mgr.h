@@ -151,7 +151,7 @@ class BufferedBlockMgr {
 
     /// Delete a block. Its buffer is released and on-disk location can be over-written.
     /// Non-blocking.
-    Status Delete();
+    void Delete();
 
     void AddRow() { ++num_rows_; }
     int num_rows() const { return num_rows_; }
@@ -313,11 +313,14 @@ class BufferedBlockMgr {
   /// fail all of them with mem limit exceeded.
   /// The min reserved buffers is often independent of data size and we still want
   /// to run small queries with very small limits.
-  /// If tracker is non-NULL, buffers used by this client are reflected in tracker.
+  /// Buffers used by this client are reflected in tracker.
+  /// tolerates_oversubscription determines how oversubscription is handled. If true,
+  /// failure to allocate a reserved buffer is not an error. If false, failure to
+  /// allocate a reserved buffer is a MEM_LIMIT_EXCEEDED error.
   /// TODO: The fact that we allow oversubscription is problematic.
-  /// as the code expects the reservations to always be granted (currently not the case).
-  Status RegisterClient(int num_reserved_buffers, MemTracker* tracker,
-      RuntimeState* state, Client** client);
+  /// as some code expects the reservations to always be granted (currently not the case).
+  Status RegisterClient(int num_reserved_buffers, bool tolerates_oversubscription,
+      MemTracker* tracker, RuntimeState* state, Client** client);
 
   /// Clears all reservations for this client.
   void ClearReservations(Client* client);
@@ -347,8 +350,8 @@ class BufferedBlockMgr {
   ///   - If there is memory pressure, block will get the buffer from 'unpin_block'.
   Status GetNewBlock(Client* client, Block* unpin_block, Block** block, int64_t len = -1);
 
-  /// Cancels the block mgr. All subsequent calls fail with Status::CANCELLED.
-  /// Idempotent.
+  /// Cancels the block mgr. All subsequent calls that return a Status fail with
+  /// Status::CANCELLED. Idempotent.
   void Cancel();
 
   /// Returns true if the block manager was cancelled.
@@ -430,7 +433,7 @@ class BufferedBlockMgr {
   /// Unpin() and Delete(). Must be called with the lock_ taken.
   Status PinBlock(Block* block, bool* pinned, Block* src, bool unpin);
   Status UnpinBlock(Block* block);
-  Status DeleteBlock(Block* block);
+  void DeleteBlock(Block* block);
 
   /// If the 'block' is NULL, checks if cancelled and returns. Otherwise, depending on
   /// 'unpin' calls either  DeleteBlock() or UnpinBlock(), which both first check for
@@ -507,7 +510,7 @@ class BufferedBlockMgr {
   const int64_t max_block_size_;
 
   /// Unpinned blocks are written when the number of free buffers is below this threshold.
-  /// Equal to the number of disks.
+  /// Equal to two times the number of disks.
   const int block_write_threshold_;
 
   /// If true, spilling is disabled. The client calls will fail if there is not enough

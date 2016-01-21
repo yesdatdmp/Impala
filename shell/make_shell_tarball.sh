@@ -18,6 +18,9 @@
 # run out-of-the-box with no configuration. The final tarball is left in
 # ${IMPALA_HOME}/shell/build.
 
+set -euo pipefail
+trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
+
 if [ "x${IMPALA_HOME}" == "x" ]; then
   echo "\$IMPALA_HOME must be set"
   exit 1
@@ -41,8 +44,6 @@ SHELL_HOME=${IMPALA_HOME}/shell
 BUILD_DIR=${SHELL_HOME}/build
 TARBALL_ROOT=${BUILD_DIR}/impala-shell-${VERSION}
 
-set -u
-set -e
 echo "Deleting all files in ${TARBALL_ROOT}/{gen-py,lib,ext-py}"
 rm -rf ${TARBALL_ROOT}/lib/* 2>&1 > /dev/null
 rm -rf ${TARBALL_ROOT}/gen-py/* 2>&1 > /dev/null
@@ -84,18 +85,18 @@ for MODULE in ${SHELL_HOME}/ext-py/*; do
   rm -rf dist 2>&1 > /dev/null
   rm -rf build 2>&1 > /dev/null
   echo "Creating an egg for ${MODULE}"
-  python setup.py bdist_egg clean
+  python setup.py -q bdist_egg clean
   cp dist/*.egg ${TARBALL_ROOT}/ext-py
   popd 2>&1 > /dev/null
 done
 
 # Copy all the shell files into the build dir
 # The location of python libs for thrift is different in rhel/centos/sles
-if [ -d ${THRIFT_HOME}python/lib/python*/site-packages/thrift ]; then
-  cp -r ${THRIFT_HOME}python/lib/python*/site-packages/thrift\
+if [ -d ${THRIFT_HOME}/python/lib/python*/site-packages/thrift ]; then
+  cp -r ${THRIFT_HOME}/python/lib/python*/site-packages/thrift\
         ${TARBALL_ROOT}/lib
 else
-  cp -r ${THRIFT_HOME}python/lib64/python*/site-packages/thrift\
+  cp -r ${THRIFT_HOME}/python/lib64/python*/site-packages/thrift\
         ${TARBALL_ROOT}/lib
 fi
 cp -r ${SHELL_HOME}/gen-py ${TARBALL_ROOT}

@@ -42,6 +42,9 @@ import com.google.common.collect.Lists;
 public class BinaryPredicate extends Predicate {
   private final static Logger LOG = LoggerFactory.getLogger(BinaryPredicate.class);
 
+  // true if this BinaryPredicate is inferred from slot equivalences, false otherwise.
+  private boolean isInferred_ = false;
+
   public enum Operator {
     EQ("=", "eq", TComparisonOp.EQ),
     NE("!=", "ne", TComparisonOp.NE),
@@ -49,6 +52,8 @@ public class BinaryPredicate extends Predicate {
     GE(">=", "ge", TComparisonOp.GE),
     LT("<", "lt", TComparisonOp.LT),
     GT(">", "gt", TComparisonOp.GT),
+    DISTINCT_FROM("IS DISTINCT FROM", "distinctfrom", TComparisonOp.DISTINCT_FROM),
+    NOT_DISTINCT("IS NOT DISTINCT FROM", "notdistinct", TComparisonOp.NOT_DISTINCT),
     // Same as EQ, except it returns True if the rhs is NULL. There is no backend
     // function for this. The functionality is embedded in the hash-join
     // implementation.
@@ -68,6 +73,7 @@ public class BinaryPredicate extends Predicate {
     public String toString() { return description_; }
     public String getName() { return name_; }
     public TComparisonOp getThriftOp() { return thriftOp_; }
+    public boolean isEquivalence() { return this == EQ || this == NOT_DISTINCT; }
 
     public Operator converse() {
       switch (this) {
@@ -77,6 +83,8 @@ public class BinaryPredicate extends Predicate {
         case GE: return LE;
         case LT: return GT;
         case GT: return LT;
+        case DISTINCT_FROM: return DISTINCT_FROM;
+        case NOT_DISTINCT: return NOT_DISTINCT;
         case NULL_MATCHING_EQ:
           throw new IllegalStateException("Not implemented");
         default: throw new IllegalStateException("Invalid operator");
@@ -119,9 +127,13 @@ public class BinaryPredicate extends Predicate {
   protected BinaryPredicate(BinaryPredicate other) {
     super(other);
     op_ = other.op_;
+    isInferred_ = other.isInferred_;
   }
 
   public boolean isNullMatchingEq() { return op_ == Operator.NULL_MATCHING_EQ; }
+
+  public boolean isInferred() { return isInferred_; }
+  public void setIsInferred() { isInferred_ = true; }
 
   @Override
   public String toSqlImpl() {
@@ -207,7 +219,7 @@ public class BinaryPredicate extends Predicate {
     // determine selectivity
     // TODO: Compute selectivity for nested predicates
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();
-    if (op_ == Operator.EQ
+    if ((op_ == Operator.EQ || op_ == Operator.NOT_DISTINCT)
         && isSingleColumnPredicate(slotRefRef, null)
         && slotRefRef.getRef().getNumDistinctValues() > 0) {
       Preconditions.checkState(slotRefRef.getRef() != null);
@@ -292,6 +304,12 @@ public class BinaryPredicate extends Predicate {
         break;
       case GT:
         newOp = Operator.LE;
+        break;
+    case DISTINCT_FROM:
+        newOp = Operator.NOT_DISTINCT;
+        break;
+    case NOT_DISTINCT:
+        newOp = Operator.DISTINCT_FROM;
         break;
       case NULL_MATCHING_EQ:
         throw new IllegalStateException("Not implemented");

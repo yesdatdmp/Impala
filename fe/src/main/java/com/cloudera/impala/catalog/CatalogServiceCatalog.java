@@ -30,6 +30,7 @@ import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.protocol.CachePoolEntry;
 import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
+import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
@@ -219,13 +220,7 @@ public class CatalogServiceCatalog extends Catalog {
     // of all items in the catalog.
     catalogLock_.readLock().lock();
     try {
-      for (String dbName: getDbNames(null)) {
-        Db db = getDb(dbName);
-        if (db == null) {
-          LOG.error("Database: " + dbName + " was expected to be in the catalog " +
-              "cache. Skipping database and all child objects for this update.");
-          continue;
-        }
+      for (Db db: getDbs(null)) {
         TCatalogObject catalogDb = new TCatalogObject(TCatalogObjectType.DATABASE,
             db.getCatalogVersion());
         catalogDb.setDb(db.toThrift());
@@ -249,12 +244,12 @@ public class CatalogServiceCatalog extends Catalog {
               catalogTbl.setTable(tbl.toThrift());
             } catch (Exception e) {
               LOG.debug(String.format("Error calling toThrift() on table %s.%s: %s",
-                  dbName, tblName, e.getMessage()), e);
+                  db.getName(), tblName, e.getMessage()), e);
               continue;
             }
             catalogTbl.setCatalog_version(tbl.getCatalogVersion());
           } else {
-            catalogTbl.setTable(new TTable(dbName, tblName));
+            catalogTbl.setTable(new TTable(db.getName(), tblName));
           }
           resp.addToObjects(catalogTbl);
         }
@@ -357,17 +352,6 @@ public class CatalogServiceCatalog extends Catalog {
     try {
       nextTableId_.set(0);
 
-      // Since UDFs/UDAs are not persisted in the metastore, we won't clear
-      // them across reset. To do this, we store all the functions before
-      // clearing and restore them after.
-      // TODO: Everything about this. Persist them.
-      List<Pair<String, HashMap<String, List<Function>>>> functions =
-          Lists.newArrayList();
-      for (Db db: dbCache_.get().values()) {
-        if (db.numFunctions() == 0) continue;
-        functions.add(Pair.create(db.getName(), db.getAllFunctions()));
-      }
-
       // Build a new DB cache, populate it, and replace the existing cache in one
       // step.
       ConcurrentHashMap<String, Db> newDbCache = new ConcurrentHashMap<String, Db>();
@@ -392,29 +376,6 @@ public class CatalogServiceCatalog extends Catalog {
         }
       } finally {
         msClient.release();
-      }
-
-      // Restore UDFs/UDAs.
-      for (Pair<String, HashMap<String, List<Function>>> dbFns: functions) {
-        Db db = null;
-        try {
-          db = newDbCache.get(dbFns.first);
-        } catch (Exception e) {
-          continue;
-        }
-        if (db == null) {
-          // DB no longer exists - it was probably dropped externally.
-          // TODO: We could restore this DB and then add the functions back?
-          continue;
-        }
-
-        for (List<Function> fns: dbFns.second.values()) {
-          for (Function fn: fns) {
-            if (fn.getBinaryType() == TFunctionBinaryType.BUILTIN) continue;
-            fn.setCatalogVersion(incrementAndGetCatalogVersion());
-            db.addFunction(fn);
-          }
-        }
       }
       dbCache_.set(newDbCache);
       // Submit tables for background loading.

@@ -204,6 +204,12 @@ void ExecNode::AddRuntimeExecOption(const string& str) {
   runtime_profile()->AddInfoString("ExecOption", runtime_exec_options_);
 }
 
+void ExecNode::AddCodegenExecOption(bool codegen_enabled, const string& extra_label) {
+  string str = codegen_enabled ? "Codegen Enabled" : "Codegen Disabled";
+  if (!extra_label.empty()) str = extra_label + " " + str;
+  AddRuntimeExecOption(str);
+}
+
 Status ExecNode::CreateTree(ObjectPool* pool, const TPlan& plan,
                             const DescriptorTbl& descs, ExecNode** root) {
   if (plan.nodes.size() == 0) {
@@ -426,7 +432,7 @@ bool ExecNode::EvalConjuncts(ExprContext* const* ctxs, int num_ctxs, TupleRow* r
 }
 
 Status ExecNode::QueryMaintenance(RuntimeState* state) {
-  ExprContext::FreeLocalAllocations(expr_ctxs_to_free_);
+  FreeLocalAllocations();
   return state->CheckQueryState();
 }
 

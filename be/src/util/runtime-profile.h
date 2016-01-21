@@ -26,7 +26,6 @@
 #include "common/atomic.h"
 #include "common/logging.h"
 #include "common/object-pool.h"
-#include "util/thread.h"
 #include "util/stopwatch.h"
 #include "util/streaming-sampler.h"
 #include "gen-cpp/RuntimeProfile_types.h"
@@ -102,6 +101,8 @@ class RuntimeProfile {
     }
 
     virtual void Set(int64_t value) { value_ = value; }
+
+    virtual void Set(int value) { value_ = value; }
 
     virtual void Set(double value) {
       value_ = *reinterpret_cast<int64_t*>(&value);
@@ -758,6 +759,14 @@ class ScopedTimer {
   RuntimeProfile::Counter* counter_;
   const bool* is_cancelled_;
 };
+
+#ifdef __APPLE__
+// On OS X rusage via thread is not supported. In addition, the majority of the fields of
+// the usage structs will be zeroed out. Since Apple is not going to be a major plaform
+// initially it will most likely be enough to capture only time.
+// C.f. http://blog.kuriositaet.de/?p=257
+#define RUSAGE_THREAD RUSAGE_SELF
+#endif
 
 /// Utility class to update ThreadCounter when the object goes out of scope or when Stop is
 /// called. Threads measurements will then be taken using getrusage.

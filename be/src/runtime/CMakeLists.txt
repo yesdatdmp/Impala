@@ -43,6 +43,7 @@ add_library(Runtime
   multi-precision.cc
   parallel-executor.cc
   plan-fragment-executor.cc
+  test-env.cc
   types.cc
   raw-value.cc
   raw-value-ir.cc
@@ -82,4 +83,4 @@ ADD_BE_TEST(buffered-tuple-stream-test)
 ADD_BE_TEST(hdfs-fs-cache-test)
 ADD_BE_TEST(tmp-file-mgr-test)
 ADD_BE_TEST(row-batch-serialize-test)
-ADD_BE_TEST(array-value-builder-test)
+ADD_BE_TEST(collection-value-builder-test)

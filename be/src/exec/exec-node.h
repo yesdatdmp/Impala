@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include "common/status.h"
+#include "exprs/expr-context.h"
 #include "runtime/descriptors.h"  // for RowDescriptor
 #include "util/runtime-profile.h"
 #include "util/blocking-queue.h"
@@ -283,6 +284,11 @@ class ExecNode {
   /// Appends option to 'runtime_exec_options_'
   void AddRuntimeExecOption(const std::string& option);
 
+  /// Helper wrapper around AddRuntimeExecOption() for adding "Codegen Enabled" or
+  /// "Codegen Disabled" exec options. If specified, 'extra_label' is prepended to the
+  /// exec option.
+  void AddCodegenExecOption(bool codegen_enabled, const string& extra_label = "");
+
   /// Frees any local allocations made by expr_ctxs_to_free_ and returns the result of
   /// state->CheckQueryState(). Nodes should call this periodically, e.g. once per input
   /// row batch. This should not be called outside the main execution thread.
@@ -301,6 +307,9 @@ class ExecNode {
   void AddExprCtxsToFree(const std::vector<ExprContext*>& ctxs);
   void AddExprCtxsToFree(const SortExecExprs& sort_exec_exprs);
 
+  /// Free any local allocations made by expr_ctxs_to_free_.
+  void FreeLocalAllocations() { ExprContext::FreeLocalAllocations(expr_ctxs_to_free_); }
+
  private:
   /// Set in ExecNode::Close(). Used to make Close() idempotent. This is not protected
   /// by a lock, it assumes all calls to Close() are made by the same thread.
@@ -312,4 +321,3 @@ class ExecNode {
 
 }
 #endif
-

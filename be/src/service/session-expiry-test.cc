@@ -41,10 +41,7 @@ DECLARE_int32(beeswax_port);
 
 TEST(SessionTest, TestExpiry) {
   FLAGS_idle_session_timeout = 1;
-  InProcessImpalaServer* impala =
-      new InProcessImpalaServer("localhost", FLAGS_be_port, 0, 0, "", 0);
-  EXIT_IF_ERROR(
-      impala->StartWithClientServers(FLAGS_beeswax_port, FLAGS_beeswax_port + 1, false));
+  InProcessImpalaServer* impala = InProcessImpalaServer::StartWithEphemeralPorts();
   IntCounter* expired_metric =
       impala->metrics()->FindMetricForTesting<IntCounter>(
           ImpaladMetricKeys::NUM_SESSIONS_EXPIRED);
@@ -58,37 +55,44 @@ TEST(SessionTest, TestExpiry) {
   EXPECT_EQ(expired_metric->value(), 0L);
   EXPECT_EQ(beeswax_session_metric->value(), 0L);
 
-  scoped_ptr<ThriftClient<ImpalaServiceClient> > beeswax_clients[5];
-  scoped_ptr<ThriftClient<ImpalaHiveServer2ServiceClient> > hs2_clients[5];
+  {
+    scoped_ptr<ThriftClient<ImpalaServiceClient> > beeswax_clients[5];
+    scoped_ptr<ThriftClient<ImpalaHiveServer2ServiceClient> > hs2_clients[5];
 
-  // Create five Beeswax clients and five HS2 clients (each HS2 gets one session each)
-  for (int i = 0; i < 5; ++i) {
-    beeswax_clients[i].reset(new ThriftClient<ImpalaServiceClient>(
-        "localhost", FLAGS_beeswax_port));
-    EXPECT_TRUE(beeswax_clients[i]->Open().ok());
+    // Create five Beeswax clients and five HS2 clients (each HS2 gets one session each)
+    for (int i = 0; i < 5; ++i) {
+      beeswax_clients[i].reset(new ThriftClient<ImpalaServiceClient>(
+              "localhost", impala->beeswax_port()));
+      EXPECT_TRUE(beeswax_clients[i]->Open().ok());
 
-    hs2_clients[i].reset(new ThriftClient<ImpalaHiveServer2ServiceClient>(
-        "localhost", FLAGS_beeswax_port + 1));
-    EXPECT_TRUE(hs2_clients[i]->Open().ok());
-    TOpenSessionResp response;
-    TOpenSessionReq request;
-    hs2_clients[i]->iface()->OpenSession(response, request);
+      hs2_clients[i].reset(new ThriftClient<ImpalaHiveServer2ServiceClient>(
+              "localhost", impala->hs2_port()));
+      EXPECT_TRUE(hs2_clients[i]->Open().ok());
+      TOpenSessionResp response;
+      TOpenSessionReq request;
+      hs2_clients[i]->iface()->OpenSession(response, request);
+    }
+
+    int64_t start = UnixMillis();
+    while (expired_metric->value() != 10 && UnixMillis() - start < 5000) {
+      SleepForMs(100);
+    }
+
+    ASSERT_EQ(expired_metric->value(), 10L) << "Sessions did not expire within 5s";
+    ASSERT_EQ(beeswax_session_metric->value(), 5L)
+        << "Beeswax sessions unexpectedly closed after expiration";
+    ASSERT_EQ(hs2_session_metric->value(), 5L)
+        << "HiveServer2 sessions unexpectedly closed after expiration";
+
+    TPingImpalaServiceResp resp;
+    ASSERT_THROW({beeswax_clients[0]->iface()->PingImpalaService(resp);}, TException)
+        << "Ping succeeded even after session expired";
   }
-
-  int64_t start = UnixMillis();
-  while (expired_metric->value() != 10 && UnixMillis() - start < 5000) {
-    SleepForMs(100);
-  }
-
-  ASSERT_EQ(expired_metric->value(), 10L) << "Sessions did not expire within 5s";
-  ASSERT_EQ(beeswax_session_metric->value(), 5L)
-      << "Beeswax sessions unexpectedly closed after expiration";
-  ASSERT_EQ(hs2_session_metric->value(), 5L)
-      << "HiveServer2 sessions unexpectedly closed after expiration";
-
-  TPingImpalaServiceResp resp;
-  ASSERT_THROW({beeswax_clients[0]->iface()->PingImpalaService(resp);}, TException)
-      << "Ping succeeded even after session expired";
+  // The TThreadedServer within 'impala' has no mechanism to join on its worker threads
+  // (it looks like there's code that's meant to do this, but it doesn't appear to
+  // work). Sleep to allow the threads closing the session to complete before tearing down
+  // the server.
+  SleepForMs(1000);
 }
 
 int main(int argc, char** argv) {

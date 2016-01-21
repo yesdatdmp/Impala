@@ -994,7 +994,11 @@ public class SingleNodePlanner {
       Expr e = i.next();
       if (!(e instanceof BinaryPredicate)) continue;
       BinaryPredicate comp = (BinaryPredicate) e;
-      if (comp.getOp() == BinaryPredicate.Operator.NE) continue;
+      if ((comp.getOp() == BinaryPredicate.Operator.NE)
+          || (comp.getOp() == BinaryPredicate.Operator.DISTINCT_FROM)
+          || (comp.getOp() == BinaryPredicate.Operator.NOT_DISTINCT)) {
+        continue;
+      }
       Expr slotBinding = comp.getSlotBinding(d.getId());
       if (slotBinding == null || !slotBinding.isConstant() ||
           !slotBinding.getType().equals(Type.STRING)) {
@@ -1164,31 +1168,24 @@ public class SingleNodePlanner {
 
     // Remove unregistered predicates that reference the same slot on
     // both sides (e.g. a = a). Such predicates have been generated from slot
-    // equivalences and may incorrectly reject rows with nulls (IMPALA-1412).
+    // equivalences and may incorrectly reject rows with nulls (IMPALA-1412/IMPALA-2643).
     Predicate<Expr> isIdentityPredicate = new Predicate<Expr>() {
       @Override
       public boolean apply(Expr expr) {
-        if (!(expr instanceof BinaryPredicate)
-            || ((BinaryPredicate) expr).getOp() != BinaryPredicate.Operator.EQ) {
-          return false;
-        }
-        if (!expr.isRegisteredPredicate()
-            && expr.getChild(0) instanceof SlotRef
-            && expr.getChild(1) instanceof SlotRef
-            && (((SlotRef) expr.getChild(0)).getSlotId() ==
-               ((SlotRef) expr.getChild(1)).getSlotId())) {
-          return true;
-        }
-        return false;
+        return (expr instanceof BinaryPredicate)
+            && ((BinaryPredicate) expr).getOp().isEquivalence()
+            && ((BinaryPredicate) expr).isInferred()
+            && expr.getChild(0).equals(expr.getChild(1));
       }
     };
     Iterables.removeIf(viewPredicates, isIdentityPredicate);
 
-    // "migrate" conjuncts_ by marking them as assigned and re-registering them with
-    // new ids.
-    // Mark pre-substitution conjuncts as assigned, since the ids of the new exprs may
-    // have changed.
+    // Migrate the conjuncts by marking the original ones as assigned, and
+    // re-registering the substituted ones with new ids.
     analyzer.markConjunctsAssigned(preds);
+    // Unset the On-clause flag of the migrated conjuncts because the migrated conjuncts
+    // apply to the post-join/agg/analytic result of the inline view.
+    for (Expr e: viewPredicates) e.setIsOnClauseConjunct(false);
     inlineViewRef.getAnalyzer().registerConjuncts(viewPredicates);
 
     // mark (fully resolve) slots referenced by remaining unassigned conjuncts as
@@ -1325,7 +1322,7 @@ public class SingleNodePlanner {
           // we only do this for one of the equivalent slots, all the other implied
           // equalities are redundant
           BinaryPredicate pred =
-              analyzer.createEqPredicate(lhsSlotIds.get(0), slotDesc.getId());
+              analyzer.createInferredEqPred(lhsSlotIds.get(0), slotDesc.getId());
           result.add(pred);
         }
       }

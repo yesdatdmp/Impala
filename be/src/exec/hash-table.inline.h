@@ -29,7 +29,7 @@ inline bool HashTableCtx::EvalAndHashBuild(TupleRow* row, uint32_t* hash) {
 
 inline bool HashTableCtx::EvalAndHashProbe(TupleRow* row, uint32_t* hash) {
   bool has_null = EvalProbeRow(row);
-  if ((!stores_nulls_ || !finds_nulls_) && has_null) return false;
+  if (has_null && !(stores_nulls_ && finds_some_nulls_)) return false;
   *hash = HashCurrentRow();
   return true;
 }
@@ -123,6 +123,15 @@ inline HashTable::Iterator HashTable::Find(HashTableCtx* ht_ctx, uint32_t hash) 
         buckets_[bucket_idx].bucketData.duplicates);
   }
   return End();
+}
+
+inline HashTable::Iterator HashTable::FindBucket(HashTableCtx* ht_ctx, uint32_t hash,
+    bool* found) {
+  ++num_probes_;
+  int64_t bucket_idx = Probe(buckets_, num_buckets_, ht_ctx, hash, found);
+  DuplicateNode* duplicates = LIKELY(bucket_idx != Iterator::BUCKET_NOT_FOUND) ?
+      buckets_[bucket_idx].bucketData.duplicates : NULL;
+  return Iterator(this, ht_ctx->row(), bucket_idx, duplicates);
 }
 
 inline HashTable::Iterator HashTable::Begin(HashTableCtx* ctx) {
@@ -251,6 +260,13 @@ inline Tuple* HashTable::Iterator::GetTuple() const {
   } else {
     return bucket->bucketData.htdata.tuple;
   }
+}
+
+inline void HashTable::Iterator::SetTuple(Tuple* tuple, uint32_t hash) {
+  DCHECK(!AtEnd());
+  DCHECK(table_->stores_tuples_);
+  table_->PrepareBucketForInsert(bucket_idx_, hash);
+  table_->buckets_[bucket_idx_].bucketData.htdata.tuple = tuple;
 }
 
 inline void HashTable::Iterator::SetMatched() {

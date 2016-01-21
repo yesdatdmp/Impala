@@ -292,7 +292,8 @@ void ImpalaServer::QueryStateUrlCallback(const Webserver::ArgumentMap& args,
     in_flight_queries.PushBack(record_json, document->GetAllocator());
   }
   document->AddMember("in_flight_queries", in_flight_queries, document->GetAllocator());
-  document->AddMember("num_in_flight_queries", sorted_query_records.size(),
+  document->AddMember("num_in_flight_queries",
+      static_cast<uint64_t>(sorted_query_records.size()),
       document->GetAllocator());
 
   Value completed_queries(kArrayType);
@@ -316,7 +317,7 @@ void ImpalaServer::QueryStateUrlCallback(const Webserver::ArgumentMap& args,
       Value location_name(lexical_cast<string>(location.first).c_str(),
           document->GetAllocator());
       location_json.AddMember("location", location_name, document->GetAllocator());
-      location_json.AddMember("count", location.second.size(),
+      location_json.AddMember("count", static_cast<uint64_t>(location.second.size()),
           document->GetAllocator());
       query_locations.PushBack(location_json, document->GetAllocator());
     }
@@ -336,7 +337,8 @@ void ImpalaServer::SessionsUrlCallback(const Webserver::ArgumentMap& args,
         document->GetAllocator());
     session_json.AddMember("type", type, document->GetAllocator());
 
-    session_json.AddMember("inflight_queries", state->inflight_queries.size(),
+    session_json.AddMember("inflight_queries",
+        static_cast<uint64_t>(state->inflight_queries.size()),
         document->GetAllocator());
     session_json.AddMember("total_queries", state->total_queries,
         document->GetAllocator());
@@ -374,13 +376,14 @@ void ImpalaServer::SessionsUrlCallback(const Webserver::ArgumentMap& args,
   }
 
   document->AddMember("sessions", sessions, document->GetAllocator());
-  document->AddMember("num_sessions", session_state_map_.size(), document->GetAllocator());
+  document->AddMember("num_sessions", static_cast<uint64_t>(session_state_map_.size()),
+      document->GetAllocator());
 }
 
 void ImpalaServer::CatalogUrlCallback(const Webserver::ArgumentMap& args,
     Document* document) {
   TGetDbsResult get_dbs_result;
-  Status status = exec_env_->frontend()->GetDbNames(NULL, NULL, &get_dbs_result);
+  Status status = exec_env_->frontend()->GetDbs(NULL, NULL, &get_dbs_result);
   if (!status.ok()) {
     Value error(status.GetDetail().c_str(), document->GetAllocator());
     document->AddMember("error", error, document->GetAllocator());
@@ -388,14 +391,14 @@ void ImpalaServer::CatalogUrlCallback(const Webserver::ArgumentMap& args,
   }
 
   Value databases(kArrayType);
-  BOOST_FOREACH(const string& db, get_dbs_result.dbs) {
+  BOOST_FOREACH(const TDatabase& db, get_dbs_result.dbs) {
     Value database(kObjectType);
-    Value str(db.c_str(), document->GetAllocator());
+    Value str(db.db_name.c_str(), document->GetAllocator());
     database.AddMember("name", str, document->GetAllocator());
 
     TGetTablesResult get_table_results;
     Status status =
-        exec_env_->frontend()->GetTableNames(db, NULL, NULL, &get_table_results);
+        exec_env_->frontend()->GetTableNames(db.db_name, NULL, NULL, &get_table_results);
     if (!status.ok()) {
       Value error(status.GetDetail().c_str(), document->GetAllocator());
       database.AddMember("error", error, document->GetAllocator());
@@ -405,7 +408,8 @@ void ImpalaServer::CatalogUrlCallback(const Webserver::ArgumentMap& args,
     Value table_array(kArrayType);
     BOOST_FOREACH(const string& table, get_table_results.tables) {
       Value table_obj(kObjectType);
-      Value fq_name(Substitute("$0.$1", db, table).c_str(), document->GetAllocator());
+      Value fq_name(Substitute("$0.$1", db.db_name, table).c_str(),
+          document->GetAllocator());
       table_obj.AddMember("fqtn", fq_name, document->GetAllocator());
       Value table_name(table.c_str(), document->GetAllocator());
       table_obj.AddMember("name", table_name, document->GetAllocator());
@@ -477,7 +481,8 @@ void PlanToJsonHelper(const map<TPlanNodeId, TPlanNodeExecSummary>& summaries,
       max_time = ::max(max_time, stat.latency_ns);
     }
     value->AddMember("output_card", cardinality, document->GetAllocator());
-    value->AddMember("num_instances", summary->second.exec_stats.size(),
+    value->AddMember("num_instances",
+        static_cast<uint64_t>(summary->second.exec_stats.size()),
         document->GetAllocator());
     if (summary->second.is_broadcast) {
       value->AddMember("is_broadcast", true, document->GetAllocator());

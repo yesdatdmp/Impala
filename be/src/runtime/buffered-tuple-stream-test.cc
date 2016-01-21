@@ -24,12 +24,13 @@
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "gutil/gscoped_ptr.h"
-#include "runtime/array-value.h"
-#include "runtime/array-value-builder.h"
 #include "runtime/buffered-tuple-stream.inline.h"
+#include "runtime/collection-value.h"
+#include "runtime/collection-value-builder.h"
 #include "runtime/row-batch.h"
-#include "runtime/tmp-file-mgr.h"
 #include "runtime/string-value.h"
+#include "runtime/test-env.h"
+#include "runtime/tmp-file-mgr.h"
 #include "service/fe-support.h"
 #include "testutil/desc-tbl-builder.h"
 #include "util/test-info.h"
@@ -63,17 +64,11 @@ static const int NUM_STRINGS = sizeof(STRINGS) / sizeof(StringValue);
 class SimpleTupleStreamTest : public testing::Test {
  protected:
   virtual void SetUp() {
-    exec_env_.reset(new ExecEnv);
-    exec_env_->disk_io_mgr()->Init(&tracker_);
-    runtime_state_.reset(
-        new RuntimeState(TExecPlanFragmentParams(), "", exec_env_.get()));
+    test_env_.reset(new TestEnv());
 
     CreateDescriptors();
 
     mem_pool_.reset(new MemPool(&tracker_));
-    metrics_.reset(new MetricGroup("buffered-tuple-stream-test"));
-    tmp_file_mgr_.reset(new TmpFileMgr);
-    tmp_file_mgr_->Init(metrics_.get());
   }
 
   virtual void CreateDescriptors() {
@@ -92,20 +87,21 @@ class SimpleTupleStreamTest : public testing::Test {
   }
 
   virtual void TearDown() {
-    block_mgr_.reset();
-    block_mgr_parent_tracker_.reset();
-    runtime_state_.reset();
-    exec_env_.reset();
+    runtime_state_ = NULL;
+    client_ = NULL;
+    pool_.Clear();
     mem_pool_->FreeAll();
+    test_env_.reset();
   }
 
-  void CreateMgr(int64_t limit, int block_size) {
-    Status status = BufferedBlockMgr::Create(runtime_state_.get(), &tracker_,
-        runtime_state_->runtime_profile(), tmp_file_mgr_.get(), limit, block_size,
-        &block_mgr_);
-    EXPECT_TRUE(status.ok());
-    status = block_mgr_->RegisterClient(0, &tracker_, runtime_state_.get(), &client_);
-    EXPECT_TRUE(status.ok());
+  /// Setup a block manager with the provided settings and client with no reservation,
+  /// tracked by tracker_.
+  void InitBlockMgr(int64_t limit, int block_size) {
+    Status status = test_env_->CreateQueryState(0, limit, block_size, &runtime_state_);
+    ASSERT_TRUE(status.ok());
+    status = runtime_state_->block_mgr()->RegisterClient(0, false, &tracker_,
+        runtime_state_, &client_);
+    ASSERT_TRUE(status.ok());
   }
 
   /// Generate the ith element of a sequence of int values.
@@ -266,7 +262,8 @@ class SimpleTupleStreamTest : public testing::Test {
   // Test adding num_batches of ints to the stream and reading them back.
   template <typename T>
   void TestValues(int num_batches, RowDescriptor* desc, bool gen_null) {
-    BufferedTupleStream stream(runtime_state_.get(), *desc, block_mgr_.get(), client_);
+    BufferedTupleStream stream(runtime_state_, *desc, runtime_state_->block_mgr(),
+        client_, true, false);
     Status status = stream.Init(-1, NULL, true);
     ASSERT_TRUE(status.ok()) << status.GetDetail();
     status = stream.UnpinStream();
@@ -302,7 +299,7 @@ class SimpleTupleStreamTest : public testing::Test {
       batch->Reset();
     }
 
-    status = stream.PrepareForRead();
+    status = stream.PrepareForRead(false);
     ASSERT_TRUE(status.ok());
 
     // Read all the rows back
@@ -317,12 +314,12 @@ class SimpleTupleStreamTest : public testing::Test {
 
   void TestIntValuesInterleaved(int num_batches, int num_batches_before_read) {
     for (int small_buffers = 0; small_buffers < 2; ++small_buffers) {
-      BufferedTupleStream stream(runtime_state_.get(), *int_desc_, block_mgr_.get(),
-          client_,
-          small_buffers == 0,  // initial small buffers
-          true,  // delete_on_read
+      BufferedTupleStream stream(runtime_state_, *int_desc_, runtime_state_->block_mgr(),
+          client_, small_buffers == 0,  // initial small buffers
           true); // read_write
       Status status = stream.Init(-1, NULL, true);
+      ASSERT_TRUE(status.ok());
+      status = stream.PrepareForRead(true);
       ASSERT_TRUE(status.ok());
       status = stream.UnpinStream();
       ASSERT_TRUE(status.ok());
@@ -351,11 +348,8 @@ class SimpleTupleStreamTest : public testing::Test {
     }
   }
 
-  scoped_ptr<ExecEnv> exec_env_;
-  scoped_ptr<RuntimeState> runtime_state_;
-  scoped_ptr<MemTracker> block_mgr_parent_tracker_;
-
-  shared_ptr<BufferedBlockMgr> block_mgr_;
+  scoped_ptr<TestEnv> test_env_;
+  RuntimeState* runtime_state_;
   BufferedBlockMgr::Client* client_;
 
   MemTracker tracker_;
@@ -363,9 +357,7 @@ class SimpleTupleStreamTest : public testing::Test {
   RowDescriptor* int_desc_;
   RowDescriptor* string_desc_;
   scoped_ptr<MemPool> mem_pool_;
-  scoped_ptr<MetricGroup> metrics_;
-  scoped_ptr<TmpFileMgr> tmp_file_mgr_;
-}; // SimpleTupleStreamTest
+};
 
 
 // Tests with a non-NULLable tuple per row.
@@ -480,7 +472,7 @@ class ArrayTupleStreamTest : public SimpleTupleStreamTest {
 
 // Basic API test. No data should be going to disk.
 TEST_F(SimpleTupleStreamTest, Basic) {
-  CreateMgr(-1, 8 * 1024 * 1024);
+  InitBlockMgr(-1, 8 * 1024 * 1024);
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
   TestValues<int>(100, int_desc_, false);
@@ -498,7 +490,7 @@ TEST_F(SimpleTupleStreamTest, Basic) {
 TEST_F(SimpleTupleStreamTest, OneBufferSpill) {
   // Each buffer can only hold 100 ints, so this spills quite often.
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(buffer_size, buffer_size);
+  InitBlockMgr(buffer_size, buffer_size);
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
 
@@ -509,7 +501,7 @@ TEST_F(SimpleTupleStreamTest, OneBufferSpill) {
 // Test with a few buffers.
 TEST_F(SimpleTupleStreamTest, ManyBufferSpill) {
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(10 * buffer_size, buffer_size);
+  InitBlockMgr(10 * buffer_size, buffer_size);
 
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
@@ -525,9 +517,10 @@ TEST_F(SimpleTupleStreamTest, ManyBufferSpill) {
 
 TEST_F(SimpleTupleStreamTest, UnpinPin) {
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(3 * buffer_size, buffer_size);
+  InitBlockMgr(3 * buffer_size, buffer_size);
 
-  BufferedTupleStream stream(runtime_state_.get(), *int_desc_, block_mgr_.get(), client_);
+  BufferedTupleStream stream(runtime_state_, *int_desc_, runtime_state_->block_mgr(),
+      client_, true, false);
   Status status = stream.Init(-1, NULL, true);
   ASSERT_TRUE(status.ok());
 
@@ -554,23 +547,35 @@ TEST_F(SimpleTupleStreamTest, UnpinPin) {
 
   vector<int> results;
 
-  // Read and verify result a few times. We should be able to reread the stream.
-  for (int i = 0; i < 3; ++i) {
-    status = stream.PrepareForRead();
+  // Read and verify result a few times. We should be able to reread the stream if
+  // we don't use delete on read mode.
+  int read_iters = 3;
+  for (int i = 0; i < read_iters; ++i) {
+    bool delete_on_read = i == read_iters - 1;
+    status = stream.PrepareForRead(delete_on_read);
     ASSERT_TRUE(status.ok());
     results.clear();
     ReadValues(&stream, int_desc_, &results);
     VerifyResults(results, offset, false);
   }
 
+  // After delete_on_read, all blocks aside from the last should be deleted.
+  // Note: this should really be 0, but the BufferedTupleStream returns eos before
+  // deleting the last block, rather than after, so the last block isn't deleted
+  // until the stream is closed.
+  DCHECK_EQ(stream.bytes_in_mem(false), buffer_size);
+
   stream.Close();
+
+  DCHECK_EQ(stream.bytes_in_mem(false), 0);
 }
 
 TEST_F(SimpleTupleStreamTest, SmallBuffers) {
   int buffer_size = 8 * 1024 * 1024;
-  CreateMgr(2 * buffer_size, buffer_size);
+  InitBlockMgr(2 * buffer_size, buffer_size);
 
-  BufferedTupleStream stream(runtime_state_.get(), *int_desc_, block_mgr_.get(), client_);
+  BufferedTupleStream stream(runtime_state_, *int_desc_, runtime_state_->block_mgr(),
+      client_, true, false);
   Status status = stream.Init(-1, NULL, false);
   ASSERT_TRUE(status.ok());
 
@@ -612,7 +617,7 @@ TEST_F(SimpleTupleStreamTest, SmallBuffers) {
 
 // Basic API test. No data should be going to disk.
 TEST_F(SimpleNullStreamTest, Basic) {
-  CreateMgr(-1, 8 * 1024 * 1024);
+  InitBlockMgr(-1, 8 * 1024 * 1024);
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
   TestValues<int>(100, int_desc_, false);
@@ -636,7 +641,7 @@ TEST_F(SimpleNullStreamTest, Basic) {
 TEST_F(MultiTupleStreamTest, MultiTupleOneBufferSpill) {
   // Each buffer can only hold 100 ints, so this spills quite often.
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(buffer_size, buffer_size);
+  InitBlockMgr(buffer_size, buffer_size);
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
 
@@ -647,7 +652,7 @@ TEST_F(MultiTupleStreamTest, MultiTupleOneBufferSpill) {
 // Test with a few buffers and rows with multiple tuples.
 TEST_F(MultiTupleStreamTest, MultiTupleManyBufferSpill) {
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(10 * buffer_size, buffer_size);
+  InitBlockMgr(10 * buffer_size, buffer_size);
 
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
@@ -666,7 +671,7 @@ TEST_F(MultiTupleStreamTest, MultiTupleManyBufferSpill) {
 TEST_F(MultiNullableTupleStreamTest, MultiNullableTupleOneBufferSpill) {
   // Each buffer can only hold 100 ints, so this spills quite often.
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(buffer_size, buffer_size);
+  InitBlockMgr(buffer_size, buffer_size);
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
   TestValues<int>(1, int_desc_, true);
@@ -681,7 +686,7 @@ TEST_F(MultiNullableTupleStreamTest, MultiNullableTupleOneBufferSpill) {
 // Test with a few buffers.
 TEST_F(MultiNullableTupleStreamTest, MultiNullableTupleManyBufferSpill) {
   int buffer_size = 100 * sizeof(int);
-  CreateMgr(10 * buffer_size, buffer_size);
+  InitBlockMgr(10 * buffer_size, buffer_size);
 
   TestValues<int>(1, int_desc_, false);
   TestValues<int>(10, int_desc_, false);
@@ -705,11 +710,11 @@ TEST_F(MultiNullableTupleStreamTest, MultiNullableTupleManyBufferSpill) {
 /// Test that deep copy works with arrays by copying into a BufferedTupleStream, freeing
 /// the original rows, then reading back the rows and verifying the contents.
 TEST_F(ArrayTupleStreamTest, TestArrayDeepCopy) {
-  CreateMgr(-1, 8 * 1024 * 1024);
-  const int NUM_ROWS = 4000;
-  BufferedTupleStream stream(runtime_state_.get(), *array_desc_, block_mgr_.get(),
-      client_, false);
   Status status;
+  InitBlockMgr(-1, 8 * 1024 * 1024);
+  const int NUM_ROWS = 4000;
+  BufferedTupleStream stream(runtime_state_, *array_desc_, runtime_state_->block_mgr(),
+      client_, false, false);
   const vector<TupleDescriptor*>& tuple_descs = array_desc_->tuple_descriptors();
   // Write out a predictable pattern of data by iterating over arrays of constants.
   int strings_index = 0; // we take the mod of this as index into STRINGS.
@@ -736,10 +741,10 @@ TEST_F(ArrayTupleStreamTest, TestArrayDeepCopy) {
     const TupleDescriptor* item_desc = array_slot_desc->collection_item_descriptor();
 
     int array_len = array_lens[array_len_index++ % num_array_lens];
-    ArrayValue* av = tuple0->GetCollectionSlot(array_slot_desc->tuple_offset());
-    av->ptr = NULL;
-    av->num_tuples = 0;
-    ArrayValueBuilder builder(av, *item_desc, mem_pool_.get(), array_len);
+    CollectionValue* cv = tuple0->GetCollectionSlot(array_slot_desc->tuple_offset());
+    cv->ptr = NULL;
+    cv->num_tuples = 0;
+    CollectionValueBuilder builder(cv, *item_desc, mem_pool_.get(), array_len);
     Tuple* array_data;
     builder.GetFreeMemory(&array_data);
     expected_row_size += item_desc->byte_size() * array_len;
@@ -763,7 +768,7 @@ TEST_F(ArrayTupleStreamTest, TestArrayDeepCopy) {
   }
 
   // Read back and verify data.
-  stream.PrepareForRead();
+  stream.PrepareForRead(false);
   strings_index = 0;
   array_len_index = 0;
   bool eos = false;
@@ -785,10 +790,10 @@ TEST_F(ArrayTupleStreamTest, TestArrayDeepCopy) {
 
       const TupleDescriptor* item_desc = array_slot_desc->collection_item_descriptor();
       int expected_array_len = array_lens[array_len_index++ % num_array_lens];
-      ArrayValue* av = tuple0->GetCollectionSlot(array_slot_desc->tuple_offset());
-      ASSERT_EQ(expected_array_len, av->num_tuples);
-      for (int j = 0; j < av->num_tuples; ++j) {
-        Tuple* item = reinterpret_cast<Tuple*>(av->ptr + j * item_desc->byte_size());
+      CollectionValue* cv = tuple0->GetCollectionSlot(array_slot_desc->tuple_offset());
+      ASSERT_EQ(expected_array_len, cv->num_tuples);
+      for (int j = 0; j < cv->num_tuples; ++j) {
+        Tuple* item = reinterpret_cast<Tuple*>(cv->ptr + j * item_desc->byte_size());
         const SlotDescriptor* string_desc = item_desc->slots()[0];
         ASSERT_FALSE(item->IsNull(string_desc->null_indicator_offset()));
         const StringValue* expected = &STRINGS[strings_index++ % NUM_STRINGS];

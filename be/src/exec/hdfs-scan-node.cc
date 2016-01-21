@@ -56,6 +56,9 @@
 #include "common/names.h"
 
 DEFINE_int32(max_row_batches, 0, "the maximum size of materialized_row_batches_");
+DEFINE_bool(suppress_unknown_disk_id_warnings, false,
+    "Suppress unknown disk id warnings generated when the HDFS implementation does not"
+    " provide volume/disk information.");
 DECLARE_string(cgroup_hierarchy_path);
 DECLARE_bool(enable_rm);
 
@@ -254,10 +257,9 @@ void* HdfsScanNode::GetCodegenFn(THdfsFileFormat::type type) {
   return it->second;
 }
 
-HdfsScanner* HdfsScanNode::CreateAndPrepareScanner(HdfsPartitionDescriptor* partition,
-    ScannerContext* context, Status* status) {
+Status HdfsScanNode::CreateAndPrepareScanner(HdfsPartitionDescriptor* partition,
+    ScannerContext* context, scoped_ptr<HdfsScanner>* scanner) {
   DCHECK(context != NULL);
-  HdfsScanner* scanner = NULL;
   THdfsCompression::type compression =
       context->GetStream()->file_desc()->file_compression;
 
@@ -267,31 +269,32 @@ HdfsScanner* HdfsScanNode::CreateAndPrepareScanner(HdfsPartitionDescriptor* part
       // Lzo-compressed text files are scanned by a scanner that it is implemented as a
       // dynamic library, so that Impala does not include GPL code.
       if (compression == THdfsCompression::LZO) {
-        scanner = HdfsLzoTextScanner::GetHdfsLzoTextScanner(this, runtime_state_);
+        scanner->reset(HdfsLzoTextScanner::GetHdfsLzoTextScanner(this, runtime_state_));
       } else {
-        scanner = new HdfsTextScanner(this, runtime_state_);
+        scanner->reset(new HdfsTextScanner(this, runtime_state_));
       }
       break;
     case THdfsFileFormat::SEQUENCE_FILE:
-      scanner = new HdfsSequenceScanner(this, runtime_state_);
+      scanner->reset(new HdfsSequenceScanner(this, runtime_state_));
       break;
     case THdfsFileFormat::RC_FILE:
-      scanner = new HdfsRCFileScanner(this, runtime_state_);
+      scanner->reset(new HdfsRCFileScanner(this, runtime_state_));
       break;
     case THdfsFileFormat::AVRO:
-      scanner = new HdfsAvroScanner(this, runtime_state_);
+      scanner->reset(new HdfsAvroScanner(this, runtime_state_));
       break;
     case THdfsFileFormat::PARQUET:
-      scanner = new HdfsParquetScanner(this, runtime_state_);
+      scanner->reset(new HdfsParquetScanner(this, runtime_state_));
       break;
     default:
-      DCHECK(false) << "Unknown Hdfs file format type:" << partition->file_format();
-      return NULL;
+      return Status(Substitute("Unknown Hdfs file format type: $0",
+          partition->file_format()));
   }
-  DCHECK(scanner != NULL);
-  runtime_state_->obj_pool()->Add(scanner);
-  *status = scanner->Prepare(context);
-  return scanner;
+  DCHECK(scanner->get() != NULL);
+  Status status = ExecDebugAction(TExecNodePhase::PREPARE_SCANNER, runtime_state_);
+  if (status.ok()) status = scanner->get()->Prepare(context);
+  if (!status.ok()) scanner->reset();
+  return status;
 }
 
 Tuple* HdfsScanNode::InitTemplateTuple(RuntimeState* state,
@@ -445,7 +448,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
     bool expected_local = (*scan_range_params_)[i].__isset.is_remote &&
         !(*scan_range_params_)[i].is_remote;
     if (expected_local && (*scan_range_params_)[i].volume_id == -1) {
-      if (!unknown_disk_id_warned_) {
+      if (!FLAGS_suppress_unknown_disk_id_warnings && !unknown_disk_id_warned_) {
         AddRuntimeExecOption("Missing Volume Id");
         runtime_state()->LogError(ErrorMsg(TErrorCode::HDFS_SCAN_NODE_UNKNOWN_DISK));
         unknown_disk_id_warned_ = true;
@@ -746,17 +749,17 @@ Status HdfsScanNode::AddDiskIoRanges(const vector<DiskIoMgr::ScanRange*>& ranges
 }
 
 void HdfsScanNode::AddMaterializedRowBatch(RowBatch* row_batch) {
-  InitNullArrayValues(row_batch);
+  InitNullCollectionValues(row_batch);
   materialized_row_batches_->AddBatch(row_batch);
 }
 
-void HdfsScanNode::InitNullArrayValues(const TupleDescriptor* tuple_desc,
+void HdfsScanNode::InitNullCollectionValues(const TupleDescriptor* tuple_desc,
     Tuple* tuple) const {
   BOOST_FOREACH(const SlotDescriptor* slot_desc, tuple_desc->collection_slots()) {
-    ArrayValue* slot = reinterpret_cast<ArrayValue*>(
+    CollectionValue* slot = reinterpret_cast<CollectionValue*>(
         tuple->GetSlot(slot_desc->tuple_offset()));
     if (tuple->IsNull(slot_desc->null_indicator_offset())) {
-      *slot = ArrayValue();
+      *slot = CollectionValue();
       continue;
     }
     // Recursively traverse collection items.
@@ -765,12 +768,12 @@ void HdfsScanNode::InitNullArrayValues(const TupleDescriptor* tuple_desc,
     for (int i = 0; i < slot->num_tuples; ++i) {
       int item_offset = i * item_desc->byte_size();
       Tuple* collection_item = reinterpret_cast<Tuple*>(slot->ptr + item_offset);
-      InitNullArrayValues(item_desc, collection_item);
+      InitNullCollectionValues(item_desc, collection_item);
     }
   }
 }
 
-void HdfsScanNode::InitNullArrayValues(RowBatch* row_batch) const {
+void HdfsScanNode::InitNullCollectionValues(RowBatch* row_batch) const {
   DCHECK_EQ(row_batch->row_desc().tuple_descriptors().size(), 1);
   const TupleDescriptor& tuple_desc =
       *row_batch->row_desc().tuple_descriptors()[tuple_idx()];
@@ -778,7 +781,7 @@ void HdfsScanNode::InitNullArrayValues(RowBatch* row_batch) const {
   for (int i = 0; i < row_batch->num_rows(); ++i) {
     Tuple* tuple = row_batch->GetRow(i)->GetTuple(tuple_idx());
     DCHECK(tuple != NULL);
-    InitNullArrayValues(&tuple_desc, tuple);
+    InitNullCollectionValues(&tuple_desc, tuple);
   }
 }
 
@@ -922,46 +925,8 @@ void HdfsScanNode::ScannerThread() {
     Status status = runtime_state_->io_mgr()->GetNextRange(reader_context_, &scan_range);
 
     if (status.ok() && scan_range != NULL) {
-      // Got a scan range. Create a new scanner object and process the range
-      // end to end (in this thread).
-      ScanRangeMetadata* metadata =
-          reinterpret_cast<ScanRangeMetadata*>(scan_range->meta_data());
-      int64_t partition_id = metadata->partition_id;
-      HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
-      DCHECK(partition != NULL) << "table_id=" << hdfs_table_->id()
-                                << " partition_id=" << partition_id
-                                << "\n" << PrintThrift(runtime_state_->fragment_params());
-      ScannerContext* context = runtime_state_->obj_pool()->Add(
-          new ScannerContext(runtime_state_, this, partition, scan_range));
-      Status scanner_status;
-      HdfsScanner* scanner = CreateAndPrepareScanner(partition, context, &scanner_status);
-      if (VLOG_QUERY_IS_ON && (!scanner_status.ok() || scanner == NULL)) {
-        stringstream ss;
-        ss << "Error preparing text scanner for scan range " << scan_range->file() <<
-            "(" << scan_range->offset() << ":" << scan_range->len() << ").";
-        ss << endl << runtime_state_->ErrorLog();
-        VLOG_QUERY << ss.str();
-      }
-
-      status = scanner->ProcessSplit();
-      if (VLOG_QUERY_IS_ON && !status.ok() && !runtime_state_->error_log().empty()) {
-        // This thread hit an error, record it and bail
-        // TODO: better way to report errors?  Maybe via the thrift interface?
-        stringstream ss;
-        ss << "Scan node (id=" << id() << ") ran into a parse error for scan range "
-           << scan_range->file() << "(" << scan_range->offset() << ":"
-           << scan_range->len() << ").";
-        if (partition->file_format() != THdfsFileFormat::PARQUET) {
-          // Parquet doesn't read the range end to end so the current offset isn't useful.
-          // TODO: make sure the parquet reader is outputting as much diagnostic
-          // information as possible.
-          ScannerContext::Stream* stream = context->GetStream();
-          ss << " Processed " << stream->total_bytes_returned() << " bytes.";
-        }
-        ss << endl << runtime_state_->ErrorLog();
-        VLOG_QUERY << ss.str();
-      }
-      scanner->Close();
+      // Got a scan range. Process the range end to end (in this thread).
+      status = ProcessSplit(scan_range);
     }
 
     if (!status.ok()) {
@@ -970,10 +935,8 @@ void HdfsScanNode::ScannerThread() {
         // If there was already an error, the main thread will do the cleanup
         if (!status_.ok()) break;
 
-        if (status.IsCancelled()) {
-          // Scan node should be the only thing that initiated scanner threads to see
-          // cancelled (i.e. limit reached).  No need to do anything here.
-          DCHECK(done_);
+        if (status.IsCancelled() && done_) {
+          // Scan node initiated scanner thread cancellation.  No need to do anything.
           break;
         }
         // Set status_ before calling SetDone() (which shuts down the RowBatchQueue),
@@ -1009,6 +972,55 @@ void HdfsScanNode::ScannerThread() {
     runtime_state_->query_resource_mgr()->NotifyThreadUsageChange(-1);
   }
   runtime_state_->resource_pool()->ReleaseThreadToken(false);
+}
+
+Status HdfsScanNode::ProcessSplit(DiskIoMgr::ScanRange* scan_range) {
+  DCHECK(scan_range != NULL);
+
+  ScanRangeMetadata* metadata =
+      reinterpret_cast<ScanRangeMetadata*>(scan_range->meta_data());
+  int64_t partition_id = metadata->partition_id;
+  HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
+  DCHECK(partition != NULL) << "table_id=" << hdfs_table_->id()
+                            << " partition_id=" << partition_id
+                            << "\n" << PrintThrift(runtime_state_->fragment_params());
+  ScannerContext context(runtime_state_, this, partition, scan_range);
+  scoped_ptr<HdfsScanner> scanner;
+  Status status = CreateAndPrepareScanner(partition, &context, &scanner);
+  if (!status.ok()) {
+    // If preparation fails, avoid leaking unread buffers in the scan_range.
+    scan_range->Cancel(status);
+
+    if (VLOG_QUERY_IS_ON) {
+      stringstream ss;
+      ss << "Error preparing scanner for scan range " << scan_range->file() <<
+          "(" << scan_range->offset() << ":" << scan_range->len() << ").";
+      ss << endl << runtime_state_->ErrorLog();
+      VLOG_QUERY << ss.str();
+    }
+    return status;
+  }
+
+  status = scanner->ProcessSplit();
+  if (VLOG_QUERY_IS_ON && !status.ok() && !runtime_state_->error_log().empty()) {
+    // This thread hit an error, record it and bail
+    stringstream ss;
+    ss << "Scan node (id=" << id() << ") ran into a parse error for scan range "
+       << scan_range->file() << "(" << scan_range->offset() << ":"
+       << scan_range->len() << ").";
+    if (partition->file_format() != THdfsFileFormat::PARQUET) {
+      // Parquet doesn't read the range end to end so the current offset isn't useful.
+      // TODO: make sure the parquet reader is outputting as much diagnostic
+      // information as possible.
+      ScannerContext::Stream* stream = context.GetStream();
+      ss << " Processed " << stream->total_bytes_returned() << " bytes.";
+    }
+    ss << endl << runtime_state_->ErrorLog();
+    VLOG_QUERY << ss.str();
+  }
+
+  scanner->Close();
+  return status;
 }
 
 void HdfsScanNode::RangeComplete(const THdfsFileFormat::type& file_type,

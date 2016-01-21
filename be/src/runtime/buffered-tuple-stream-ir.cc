@@ -14,24 +14,24 @@
 
 #include "runtime/buffered-tuple-stream.inline.h"
 
-#include "runtime/array-value.h"
+#include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
 #include "runtime/tuple-row.h"
 
 using namespace impala;
 
-bool BufferedTupleStream::DeepCopy(TupleRow* row, uint8_t** dst) {
+bool BufferedTupleStream::DeepCopy(TupleRow* row) {
   if (nullable_tuple_) {
-    return DeepCopyInternal<true>(row, dst);
+    return DeepCopyInternal<true>(row);
   } else {
-    return DeepCopyInternal<false>(row, dst);
+    return DeepCopyInternal<false>(row);
   }
 }
 
 // TODO: this really needs codegen
 // TODO: in case of duplicate tuples, this can redundantly serialize data.
 template <bool HasNullableTuple>
-bool BufferedTupleStream::DeepCopyInternal(TupleRow* row, uint8_t** dst) {
+bool BufferedTupleStream::DeepCopyInternal(TupleRow* row) {
   if (UNLIKELY(write_block_ == NULL)) return false;
   DCHECK_GE(null_indicators_write_block_, 0);
   DCHECK(write_block_->is_pinned()) << DebugString() << std::endl
@@ -45,7 +45,6 @@ bool BufferedTupleStream::DeepCopyInternal(TupleRow* row, uint8_t** dst) {
   }
   // Allocate the maximum possible buffer for the fixed portion of the tuple.
   uint8_t* tuple_buf = write_block_->Allocate<uint8_t>(fixed_tuple_row_size_);
-  if (dst != NULL) *dst = tuple_buf;
   // Total bytes allocated in write_block_ for this row. Saved so we can roll back
   // if this row doesn't fit.
   int bytes_allocated = fixed_tuple_row_size_;
@@ -103,8 +102,8 @@ bool BufferedTupleStream::DeepCopyInternal(TupleRow* row, uint8_t** dst) {
     }
   }
 
-  // Copy collection slots. We copy array data in a well-defined order so we do not need
-  // to convert pointers to offsets on the write path.
+  // Copy collection slots. We copy collection data in a well-defined order so we do not
+  // need to convert pointers to offsets on the write path.
   for (int i = 0; i < collection_slots_.size(); ++i) {
     Tuple* tuple = row->GetTuple(collection_slots_[i].first);
     if (HasNullableTuple && tuple == NULL) continue;
@@ -143,20 +142,20 @@ bool BufferedTupleStream::CopyCollections(const Tuple* tuple,
   for (int i = 0; i < collection_slots.size(); ++i) {
     const SlotDescriptor* slot_desc = collection_slots[i];
     if (tuple->IsNull(slot_desc->null_indicator_offset())) continue;
-    const ArrayValue* av = tuple->GetCollectionSlot(slot_desc->tuple_offset());
+    const CollectionValue* cv = tuple->GetCollectionSlot(slot_desc->tuple_offset());
     const TupleDescriptor& item_desc = *slot_desc->collection_item_descriptor();
-    if (LIKELY(av->num_tuples > 0)) {
-      int array_byte_size = av->num_tuples * item_desc.byte_size();
-      if (UNLIKELY(write_block_->BytesRemaining() < array_byte_size)) {
+    if (LIKELY(cv->num_tuples > 0)) {
+      int coll_byte_size = cv->num_tuples * item_desc.byte_size();
+      if (UNLIKELY(write_block_->BytesRemaining() < coll_byte_size)) {
         return false;
       }
-      uint8_t* array_data = write_block_->Allocate<uint8_t>(array_byte_size);
-      (*bytes_allocated) += array_byte_size;
-      memcpy(array_data, av->ptr, array_byte_size);
+      uint8_t* coll_data = write_block_->Allocate<uint8_t>(coll_byte_size);
+      (*bytes_allocated) += coll_byte_size;
+      memcpy(coll_data, cv->ptr, coll_byte_size);
       if (!item_desc.HasVarlenSlots()) continue;
-      // Copy variable length data when present in array items.
-      for (int j = 0; j < av->num_tuples; ++j) {
-        Tuple* item = reinterpret_cast<Tuple*>(array_data);
+      // Copy variable length data when present in collection items.
+      for (int j = 0; j < cv->num_tuples; ++j) {
+        Tuple* item = reinterpret_cast<Tuple*>(coll_data);
         if (UNLIKELY(!CopyStrings(item, item_desc.string_slots(), bytes_allocated))) {
           return false;
         }
@@ -164,7 +163,7 @@ bool BufferedTupleStream::CopyCollections(const Tuple* tuple,
             bytes_allocated))) {
           return false;
         }
-        array_data += item_desc.byte_size();
+        coll_data += item_desc.byte_size();
       }
     }
   }

@@ -33,7 +33,8 @@ import com.cloudera.impala.catalog.HdfsCompression;
 import com.cloudera.impala.catalog.HdfsFileFormat;
 import com.cloudera.impala.catalog.RowFormat;
 import com.cloudera.impala.catalog.Table;
-
+import com.cloudera.impala.catalog.View;
+import com.cloudera.impala.common.PrintUtils;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -113,7 +114,7 @@ public class ToSqlUtils {
   }
 
   /**
-   * Returns the "CREATE TABLE" SQL string corresponding to the given CreateTableStmt.
+   * Returns the "CREATE TABLE" SQL string corresponding to the given CreateTableStmt
    * statement.
    */
   public static String getCreateTableSql(CreateTableStmt stmt) {
@@ -125,19 +126,44 @@ public class ToSqlUtils {
     for (ColumnDef col: stmt.getPartitionColumnDefs()) {
       partitionColsSql.add(col.toString());
     }
+    String location = stmt.getLocation() == null ? null : stmt.getLocation().toString();
     // TODO: Pass the correct compression, if applicable.
     return getCreateTableSql(stmt.getDb(), stmt.getTbl(), stmt.getComment(), colsSql,
         partitionColsSql, stmt.getTblProperties(), stmt.getSerdeProperties(),
         stmt.isExternal(), stmt.getIfNotExists(), stmt.getRowFormat(),
         HdfsFileFormat.fromThrift(stmt.getFileFormat()), HdfsCompression.NONE, null,
-        stmt.getLocation().toString());
+        location);
   }
 
   /**
-   * Returns a "CREATE TABLE" statement that creates the specified table.
+   * Returns the "CREATE TABLE" SQL string corresponding to the given
+   * CreateTableAsSelectStmt statement.
+   */
+  public static String getCreateTableSql(CreateTableAsSelectStmt stmt) {
+    CreateTableStmt innerStmt = stmt.getCreateStmt();
+    // Only add partition column labels to output. Table columns must not be specified as
+    // they are deduced from the select statement.
+    ArrayList<String> partitionColsSql = Lists.newArrayList();
+    for (ColumnDef col: innerStmt.getPartitionColumnDefs()) {
+      partitionColsSql.add(col.getColName());
+    }
+    // TODO: Pass the correct compression, if applicable.
+    String createTableSql = getCreateTableSql(innerStmt.getDb(), innerStmt.getTbl(),
+        innerStmt.getComment(), null, partitionColsSql, innerStmt.getTblProperties(),
+        innerStmt.getSerdeProperties(), innerStmt.isExternal(),
+        innerStmt.getIfNotExists(), innerStmt.getRowFormat(),
+        HdfsFileFormat.fromThrift(innerStmt.getFileFormat()), HdfsCompression.NONE, null,
+        innerStmt.getLocation().toString());
+    return createTableSql + " AS " + stmt.getQueryStmt().toSql();
+  }
+
+  /**
+   * Returns a "CREATE TABLE" or "CREATE VIEW" statement that creates the specified
+   * table.
    */
   public static String getCreateTableSql(Table table) throws CatalogException {
     Preconditions.checkNotNull(table);
+    if (table instanceof View) return getCreateViewSql((View)table);
     org.apache.hadoop.hive.metastore.api.Table msTable = table.getMetaStoreTable();
     HashMap<String, String> properties = Maps.newHashMap(msTable.getParameters());
     boolean isExternal = msTable.getTableType() != null &&
@@ -185,8 +211,9 @@ public class ToSqlUtils {
     sb.append("TABLE ");
     if (ifNotExists) sb.append("IF NOT EXISTS ");
     if (dbName != null) sb.append(dbName + ".");
+    sb.append(tableName);
     if (columnsSql != null) {
-      sb.append(tableName + " (\n  ");
+      sb.append(" (\n  ");
       sb.append(Joiner.on(", \n  ").join(columnsSql));
       sb.append("\n)");
     }
@@ -256,6 +283,17 @@ public class ToSqlUtils {
     for (Function fn: functions) {
       sb.append(fn.toSql(false));
     }
+    return sb.toString();
+  }
+
+  public static String getCreateViewSql(View view) {
+    StringBuffer sb = new StringBuffer();
+    sb.append("CREATE VIEW ");
+    // Use toSql() to ensure that the table name and query statement are normalized
+    // and identifiers are quoted.
+    sb.append(view.getTableName().toSql());
+    sb.append(" AS\n");
+    sb.append(view.getQueryStmt().toSql());
     return sb.toString();
   }
 

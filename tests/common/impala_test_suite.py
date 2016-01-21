@@ -136,6 +136,12 @@ class ImpalaTestSuite(BaseTestSuite):
     return hdfs_client
 
   @classmethod
+  def all_db_names(self):
+    results = self.client.execute("show databases").data
+    # Extract first column - database name
+    return [row.split("\t")[0] for row in results]
+
+  @classmethod
   def cleanup_db(self, db_name, sync_ddl=1):
     self.client.execute("use default")
     self.client.set_configuration({'sync_ddl': sync_ddl})
@@ -425,9 +431,10 @@ class ImpalaTestSuite(BaseTestSuite):
       tf_dimensions = TestDimension('table_format', *table_formats)
     else:
       tf_dimensions = load_table_info_dimension(cls.get_workload(), exploration_strategy)
-    # If 'skip_hbase' is specified or the filesystem is either isilon or s3, we don't
+    # If 'skip_hbase' is specified or the filesystem is isilon, s3 or local, we don't
     # need the hbase dimension.
-    if pytest.config.option.skip_hbase or TARGET_FILESYSTEM.lower() in ['s3', 'isilon']:
+    if pytest.config.option.skip_hbase or TARGET_FILESYSTEM.lower() \
+        in ['s3', 'isilon', 'local']:
       for tf_dimension in tf_dimensions:
         if tf_dimension.value.file_format == "hbase":
           tf_dimensions.remove(tf_dimension)

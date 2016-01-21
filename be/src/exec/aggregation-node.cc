@@ -102,6 +102,7 @@ Status AggregationNode::Prepare(RuntimeState* state) {
       output_tuple_desc_->slots().size());
   RETURN_IF_ERROR(
       Expr::Prepare(probe_expr_ctxs_, state, child(0)->row_desc(), expr_mem_tracker()));
+  AddExprCtxsToFree(probe_expr_ctxs_);
 
   // Construct build exprs from intermediate_agg_tuple_desc_
   for (int i = 0; i < probe_expr_ctxs_.size(); ++i) {
@@ -123,6 +124,7 @@ Status AggregationNode::Prepare(RuntimeState* state) {
   RowDescriptor build_row_desc(intermediate_tuple_desc_, false);
   RETURN_IF_ERROR(
       Expr::Prepare(build_expr_ctxs_, state, build_row_desc, expr_mem_tracker()));
+  AddExprCtxsToFree(build_expr_ctxs_);
 
   agg_fn_ctxs_.resize(aggregate_evaluators_.size());
   int j = probe_expr_ctxs_.size();
@@ -142,17 +144,20 @@ Status AggregationNode::Prepare(RuntimeState* state) {
   }
 
   // TODO: how many buckets?
-  hash_tbl_.reset(new OldHashTable(state, build_expr_ctxs_, probe_expr_ctxs_, 1,
-                                   true, true, id(), mem_tracker(), true));
+  hash_tbl_.reset(new OldHashTable(state, build_expr_ctxs_, probe_expr_ctxs_, 1, true,
+      std::vector<bool>(build_expr_ctxs_.size(), true), id(), mem_tracker(), true));
 
   if (probe_expr_ctxs_.empty()) {
     // create single intermediate tuple now; we need to output something
     // even if our input is empty
     singleton_intermediate_tuple_ = ConstructIntermediateTuple();
+    // Check for failures during AggFnEvaluator::Init().
+    RETURN_IF_ERROR(state->GetQueryStatus());
     hash_tbl_->Insert(singleton_intermediate_tuple_);
     output_iterator_ = hash_tbl_->Begin();
   }
 
+  bool codegen_enabled;
   if (state->codegen_enabled()) {
     LlvmCodeGen* codegen;
     RETURN_IF_ERROR(state->GetCodegen(&codegen));
@@ -164,10 +169,11 @@ Status AggregationNode::Prepare(RuntimeState* state) {
         // Update to using codegen'd process row batch.
         codegen->AddFunctionToJit(codegen_process_row_batch_fn_,
             reinterpret_cast<void**>(&process_row_batch_fn_));
-        AddRuntimeExecOption("Codegen Enabled");
+        codegen_enabled = true;
       }
     }
   }
+  AddCodegenExecOption(codegen_enabled);
   return Status::OK();
 }
 

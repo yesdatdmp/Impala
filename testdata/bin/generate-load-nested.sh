@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
-#set -x
+set -euo pipefail
+trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)' ERR
 
 SHELL_CMD=${IMPALA_HOME}/bin/impala-shell.sh
 
@@ -122,7 +122,7 @@ do
   done
 
   if $FLATTEN; then
-    dropdb --if-exists -U postgres random_nested_db_flat_${NUM}
+    dropdb -U postgres random_nested_db_flat_${NUM} 2> /dev/null || true
     ${IMPALA_HOME}/tests/comparison/data_generator.py --use-postgresql \
       --db-name=random_nested_db_flat_${NUM} migrate
   fi

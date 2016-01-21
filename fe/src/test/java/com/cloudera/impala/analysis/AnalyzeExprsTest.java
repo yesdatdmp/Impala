@@ -20,6 +20,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import org.junit.Assert;
@@ -41,6 +42,7 @@ import com.cloudera.impala.catalog.Type;
 import com.cloudera.impala.catalog.Function.CompareMode;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TExpr;
+import com.cloudera.impala.thrift.TFunctionBinaryType;
 import com.cloudera.impala.thrift.TQueryOptions;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -159,33 +161,83 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
   @Test
   public void TestBinaryPredicates() throws AnalysisException {
-    AnalyzesOk("select * from functional.alltypes where bool_col != true");
-    AnalyzesOk("select * from functional.alltypes where tinyint_col <> 1");
-    AnalyzesOk("select * from functional.alltypes where smallint_col <= 23");
-    AnalyzesOk("select * from functional.alltypes where int_col > 15");
-    AnalyzesOk("select * from functional.alltypes where bigint_col >= 17");
-    AnalyzesOk("select * from functional.alltypes where float_col < 15.0");
-    AnalyzesOk("select * from functional.alltypes where double_col > 7.7");
-    // automatic type cast if compatible
-    AnalyzesOk("select * from functional.alltypes where 1 = 0");
-    AnalyzesOk("select * from functional.alltypes where int_col = smallint_col");
-    AnalyzesOk("select * from functional.alltypes where bigint_col = float_col");
-    AnalyzesOk("select * from functional.alltypes where bool_col = 0");
-    AnalyzesOk("select * from functional.alltypes where int_col = cast('0' as int)");
-    AnalyzesOk("select * from functional.alltypes where cast(string_col as int) = 15");
-    // tests with NULL
-    AnalyzesOk("select * from functional.alltypes where bool_col != NULL");
-    AnalyzesOk("select * from functional.alltypes where tinyint_col <> NULL");
-    AnalyzesOk("select * from functional.alltypes where smallint_col <= NULL");
-    AnalyzesOk("select * from functional.alltypes where int_col > NULL");
-    AnalyzesOk("select * from functional.alltypes where bigint_col >= NULL");
-    AnalyzesOk("select * from functional.alltypes where float_col < NULL");
-    AnalyzesOk("select * from functional.alltypes where double_col > NULL");
-    AnalyzesOk("select * from functional.alltypes where string_col = NULL");
-    AnalyzesOk("select * from functional.alltypes where timestamp_col = NULL");
+    for (String operator: new String[]{"<=>", "IS DISTINCT FROM",
+        "IS NOT DISTINCT FROM", "<", ">", ">=", "<=", "!=", "=", "<>"}) {
+      // Operator can compare numeric values (literals, casts, and columns), even ones of
+      // different types.
+      ArrayList<String> numericValues =
+          new ArrayList<String>(Arrays.asList("0", "1", "1.1", "-7", "-7.7", "1.2e99",
+              "false", "1234567890123456789012345678901234567890", "tinyint_col",
+              "smallint_col", "int_col", "bigint_col", "float_col", "double_col"));
+      String numericTypes[] = new String[] {
+          "TINYINT", "SMALLINT", "INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL"};
+      for (String numericType : numericTypes) {
+        numericValues.add("cast(NULL as " + numericType + ")");
+      }
+      for (String lhs : numericValues) {
+        for (String rhs : numericValues) {
+          AnalyzesOk("select * from functional.alltypes where " + lhs + " "
+              + operator + " " + rhs);
+        }
+      }
 
-    AnalyzesOk("select cast('hi' as CHAR(2)) = cast('hi' as CHAR(3))");
-    AnalyzesOk("select cast('hi' as CHAR(2)) = 'hi'");
+      // Operator can compare identical non-numeric types
+      for (String operand :
+          new String[] {"bool_col", "string_col", "timestamp_col", "NULL"}) {
+        AnalyzesOk("select * from functional.alltypes where " + operand + " "
+            + operator + " " + operand);
+        AnalyzesOk("select * from functional.alltypes where " + operand + " "
+            + operator + " NULL");
+        AnalyzesOk(
+            "select * from functional.alltypes where NULL " + operator + " " + operand);
+      }
+
+      // Operator can compare string column and literals
+      AnalyzesOk(
+          "select * from functional.alltypes where string_col " + operator + " 'hi'");
+      // Operator can compare timestamp column and literals
+      AnalyzesOk("select * from functional.alltypes where timestamp_col "
+          + operator + " '1993-01-21 02:00:00'");
+      // Operator can compare bool column and literals
+      AnalyzesOk("select * from functional.alltypes where bool_col " + operator
+          + " true");
+
+      // Decimal types of different precisions and scales are comparable
+      String decimalColumns[] = new String[]{"d1", "d2", "d3", "d4", "d5", "NULL"};
+      for (String operand1 : decimalColumns) {
+        for (String operand2 : decimalColumns) {
+          AnalyzesOk("select * from functional.decimal_tbl where " + operand1 + " "
+              + operator + " " + operand2);
+        }
+      }
+
+      // Chars of different length are comparable
+      for (int i = 1; i < 16; ++i) {
+        AnalyzesOk("select cast('hi' as char(" + i + ")) " + operator +
+            " 'hi'");
+        AnalyzesOk("select cast('hi' as char(" + i + ")) " + operator +
+            " NULL");
+        for (int j = 1; j < 16; ++j) {
+          AnalyzesOk("select cast('hi' as char(" + i + ")) " + operator +
+              " cast('hi' as char(" + j + "))");
+        }
+      }
+
+      // Binary operators do not operate on expression with incompatible types
+      for (String numeric_type: new String[]{"BOOLEAN", "TINYINT", "SMALLINT", "INT",
+          "BIGINT", "FLOAT", "DOUBLE", "DECIMAL(9,0)"}) {
+        for (String string_type: new String[]{"STRING", "TIMESTAMP"}) {
+          AnalysisError("select cast(NULL as " + numeric_type + ") "
+              + operator + " cast(NULL as " + string_type + ")",
+              "operands of type " + numeric_type + " and " + string_type +
+              " are not comparable:");
+          AnalysisError("select cast(NULL as " + string_type + ") "
+              + operator + " cast(NULL as " + numeric_type + ")",
+              "operands of type " + string_type + " and " + numeric_type +
+              " are not comparable:");
+        }
+      }
+    }
 
     // invalid casts
     AnalysisError("select * from functional.alltypes where bool_col = '15'",
@@ -1752,32 +1804,31 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
   @Test
   public void TestUdfs() {
-    HdfsUri dummyUri = new HdfsUri("");
-
     AnalysisError("select udf()", "default.udf() unknown");
     AnalysisError("select functional.udf()", "functional.udf() unknown");
     AnalysisError("select udf(1)", "default.udf() unknown");
 
     // Add a udf default.udf(), default.udf(int), default.udf(string...),
     // default.udf(int, string...) and functional.udf(double)
-    catalog_.addFunction(new ScalarFunction(new FunctionName("default", "udf"),
-        new ArrayList<Type>(), Type.INT, dummyUri, null, null, null));
-    catalog_.addFunction(new ScalarFunction(new FunctionName("default", "udf"),
-        Lists.<Type>newArrayList(Type.INT),
-        Type.INT, dummyUri, null, null, null));
-    ScalarFunction varArgsUdf1 = new ScalarFunction(new FunctionName("default", "udf"),
-        Lists.<Type>newArrayList(Type.STRING),
-        Type.INT, dummyUri, null, null, null);
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf",
+        new ArrayList<Type>(), Type.INT, "/dummy", "dummy.class", null, null,
+        TFunctionBinaryType.NATIVE));
+    catalog_.addFunction(ScalarFunction.createForTesting("default", "udf",
+        Lists.<Type>newArrayList(Type.INT), Type.INT, "/dummy", "dummy.class",
+        null, null, TFunctionBinaryType.NATIVE));
+    ScalarFunction varArgsUdf1 = ScalarFunction.createForTesting("default",
+        "udf", Lists.<Type>newArrayList(Type.STRING), Type.INT, "/dummy",
+        "dummy.class", null, null, TFunctionBinaryType.NATIVE);
     varArgsUdf1.setHasVarArgs(true);
     catalog_.addFunction(varArgsUdf1);
-    ScalarFunction varArgsUdf2 = new ScalarFunction(new FunctionName("default", "udf"),
-        Lists.<Type>newArrayList(Type.INT, Type.STRING),
-        Type.INT, dummyUri, null, null, null);
+    ScalarFunction varArgsUdf2 = ScalarFunction.createForTesting("default",
+        "udf", Lists.<Type>newArrayList(Type.INT, Type.STRING), Type.INT,
+        "/dummy", "dummy.class", null, null, TFunctionBinaryType.NATIVE);
     varArgsUdf2.setHasVarArgs(true);
     catalog_.addFunction(varArgsUdf2);
-    ScalarFunction udf = new ScalarFunction(new FunctionName("functional", "udf"),
-        Lists.<Type>newArrayList(Type.DOUBLE),
-        Type.INT, dummyUri, null, null, null);
+    ScalarFunction udf = ScalarFunction.createForTesting("functional", "udf",
+        Lists.<Type>newArrayList(Type.DOUBLE), Type.INT, "/dummy",
+        "dummy.class", null, null, TFunctionBinaryType.NATIVE);
     catalog_.addFunction(udf);
 
     AnalyzesOk("select udf()");
@@ -1853,8 +1904,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     testFuncExprDepthLimit("lower(", "'abc'", ")");
 
     // UDF.
-    ScalarFunction udf = new ScalarFunction(new FunctionName("default", "udf"),
-        Lists.<Type>newArrayList(Type.INT), Type.INT, new HdfsUri(""), null, null, null);
+    ScalarFunction udf = ScalarFunction.createForTesting("default", "udf",
+        Lists.<Type>newArrayList(Type.INT), Type.INT, "/dummy",
+        "dummy.class", null, null, TFunctionBinaryType.NATIVE);
     catalog_.addFunction(udf);
     try {
       testFuncExprDepthLimit("udf(", "1", ")");
@@ -2027,13 +2079,6 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         "'~' operation only allowed on integer types: ~d1");
     AnalysisError("select d1! from functional.decimal_tbl",
         "'!' operation only allowed on integer types: d1!");
-
-    AnalyzesOk("select d3 = d4 from functional.decimal_tbl");
-    AnalyzesOk("select d5 != d1 from functional.decimal_tbl");
-    AnalyzesOk("select d2 > d2 from functional.decimal_tbl");
-    AnalyzesOk("select d4 >= d1 from functional.decimal_tbl");
-    AnalyzesOk("select d2 < d5 from functional.decimal_tbl");
-    AnalyzesOk("select d2 <= d5 from functional.decimal_tbl");
   }
 
   @Test
